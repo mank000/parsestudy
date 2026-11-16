@@ -1,0 +1,21 @@
+{
+  "run_id": 8,
+  "status": "partial",
+  "reason": "page_budget",
+  "records": 300,
+  "details": 0,
+  "detail_missing": 0,
+  "pages": 3,
+  "session_attempts": 4,
+  "session_responses": 4,
+  "session_bytes": 103806,
+  "session_seconds": 5.247,
+  "http_statuses": {
+    "200": 4
+  },
+  "http_errors": 0,
+  "transport_errors": 0,
+  "logged_errors": 0,
+  "retry_at": null,
+  "http_503": null
+}
