@@ -44,6 +44,8 @@ class ApiFixture(BaseHTTPRequestHandler):
             body = self.server.robots.encode()
             status = self.server.robots_status
             content_type = "text/plain"
+            if status == 503:
+                extra["Retry-After"] = "60"
         elif url.path == "/api/v2/cars":
             content_type = "application/json"
             if self.server.block:
@@ -119,6 +121,7 @@ class CatalogIntegration(unittest.TestCase):
 
         from catalog.inventory import fetch_inventory
         from catalog.store import initialize, insert_vehicles
+        from psycopg.types.json import Jsonb
 
         with psycopg.connect(self.dsn, autocommit=True) as db:
             initialize(db)
@@ -132,15 +135,34 @@ class CatalogIntegration(unittest.TestCase):
                 cars[1]["specs"]["color"] = "Чёрный"
                 cars[1]["listing"]["sell_status"] = "sold"
                 insert_vehicles(db, run_id, cars)
+                detail = {**cars[1], "pricing": {"status": "partial", "presentation": {
+                    "kind": "known_part", "amount_rub": 700000,
+                }}}
+                db.execute("UPDATE vehicle SET detail=%s WHERE run_id=%s AND car_id=10002",
+                           (Jsonb(detail), run_id))
+                carhub = db.execute("""
+                    INSERT INTO crawl_run (origin, mode, page_limit, status)
+                    VALUES ('https://carhubauto.ru', 'listing', 100, 'partial') RETURNING id
+                    """).fetchone()[0]
+                insert_vehicles(db, carhub, [vehicle(10001), vehicle(10004)])
                 db.execute("""
                     INSERT INTO sitemap_car VALUES
                     (10001,'KR','Toyota','Test','Toyota Test','/catalog/example/10001/'),
                     (10003,'JP','Honda','Fit','Honda Fit','/catalog/example/10003/')
                     """)
                 with db.cursor(row_factory=dict_row) as cursor:
-                    _, groups, records, _, _ = fetch_inventory(cursor, {})
-                    self.assertEqual((groups[0]["count"], groups[0]["enriched"]), (3, 2))
+                    _, groups, records, _, _ = fetch_inventory(cursor, {"scope": "all"})
+                    self.assertEqual((groups[0]["count"], groups[0]["enriched"]), (2, 1))
                     self.assertEqual(sum(car["car_id"] == 10001 for car in records), 1)
+                    _, groups, records, _, _ = fetch_inventory(cursor, {"scope": "details"})
+                    self.assertEqual((groups[0]["priced"], groups[0]["partial"]), (1, 1))
+                    self.assertEqual([car["car_id"] for car in records], [10002, 10001])
+                    _, groups, records, _, _ = fetch_inventory(cursor, {
+                        "scope": "details", "source": "https://carhubauto.ru", "price_type": "seller",
+                    })
+                    self.assertEqual([car["car_id"] for car in records], [10004, 10001])
+                    self.assertEqual((groups[0]["full"], groups[0]["seller"]), (2, 2))
+                    self.assertEqual(records[0]["price"], records[0]["seller_price"])
                     _, groups, records, _, _ = fetch_inventory(cursor, {
                         "color": "белый", "availability": "active", "min_price": "1000000",
                         "max_price": "10000000", "sort": "price_up",
@@ -203,6 +225,12 @@ class CatalogIntegration(unittest.TestCase):
         self.server.robots_status = 503
         metrics = json.loads(self.cli("crawl", code=1))
         self.assertEqual(metrics["reason"], "robots_http_503")
+        self.assertEqual(metrics["http_statuses"], {"503": 1})
+        self.assertEqual(metrics["http_errors"], 1)
+        self.assertEqual(metrics["http_503"], {
+            "path": "/robots.txt", "content_type": "text/plain", "retry_after": "60",
+        })
+        self.assertIsNotNone(metrics["retry_at"])
         self.assertEqual(dict(self.server.requests), {"/robots.txt": 1})
 
     def test_repeat_cursor_rolls_back_page(self):

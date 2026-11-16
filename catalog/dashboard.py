@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 import psycopg
 from psycopg.rows import dict_row, tuple_row
 
-from .inventory import inventory_html
+from .inventory import car_html, inventory_html
 from .report import render_report
 
 
@@ -47,7 +47,8 @@ def overview():
     else:
         audit = read_metrics("live-satauto-sitemap.json")
         captured = update_date()
-    probe = read_metrics("live-carhub-recheck.json")
+    probe = read_metrics("live-carhub-demo.json" if (REPORTS / "live-carhub-demo.json").is_file()
+                         else "live-carhub-2026-11-17.json")
     benchmark = read_metrics("benchmark.json")
     scope = "Полная карта сайта" if audit["complete"] else "Часть карты сайта"
     stats = [
@@ -81,7 +82,7 @@ def overview():
       </section>
       <section class="panel"><h2>Проверка сборщика</h2>
         <dl class="checks">
-          <div><dt>CarHub · живой запрос</dt><dd>{escape(probe["reason"].replace("http_", "HTTP "))} · {number(probe["session_seconds"], 3)} с</dd></div>
+          <div><dt>CarHub · живой прогон</dt><dd>{number(probe["records"])} записей · {number(probe["session_attempts"])} запроса · {number(probe["session_seconds"], 3)} с</dd></div>
           <div><dt>Локальный тест · синтетические данные</dt><dd>{number(benchmark["records"])} записей за {number(benchmark["session_seconds"], 3)} с</dd></div>
           <div><dt>Запросов в локальном тесте</dt><dd>{number(benchmark["session_attempts"])}</dd></div>
         </dl>
@@ -183,19 +184,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if url.path == "/style.css":
             return self.send_content(200, "text/css", (ASSETS / "style.css").read_text(encoding="utf-8"))
         params = parse_qs(url.query, keep_blank_values=True)
-        if url.path == "/" and "run" not in params:
-            status, content = inventory_html(self.server.dsn, params)
+        if url.path == "/car" or (url.path == "/" and "run" not in params):
+            if url.path == "/car":
+                run, car = (parse_id(params.get(key, [""])[0]) for key in ("run", "id"))
+                if run is None or car is None:
+                    return self.send_content(400, "text/plain", "Некорректный ID карточки или прогона")
+                status, content = car_html(self.server.dsn, run, car)
+            else:
+                status, content = inventory_html(self.server.dsn, params)
             template = (ASSETS / "inventory.html").read_text(encoding="utf-8")
             return self.send_content(status, "text/html", template.format(content=content))
         if url.path not in ("/", "/analytics"):
             return self.send_content(404, "text/plain", "Страница не найдена")
         selected = params.get("run", [None])[0]
-        if selected is not None and (not re.fullmatch(r"[1-9][0-9]{0,18}", selected) or int(selected) > 2**63 - 1):
+        if selected is not None and parse_id(selected) is None:
             return self.send_content(400, "text/plain", "Некорректный номер прогона")
         prices, history = database_sections(self.server.dsn, int(selected) if selected else None)
         html = (ASSETS / "index.html").read_text(encoding="utf-8")
         html = html.format(overview=overview(), prices=prices, history=history)
         return self.send_content(200, "text/html", html)
+
+
+def parse_id(value):
+    if re.fullmatch(r"[1-9][0-9]{0,18}", value) and int(value) <= 2**63 - 1:
+        return int(value)
+    return None
 
 
 def main():
