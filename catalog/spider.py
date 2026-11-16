@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import scrapy
 from psycopg.types.json import Jsonb
@@ -12,6 +12,24 @@ from .store import insert_vehicles
 
 
 PUBLIC_ORIGIN = "https://carhubauto.ru"
+
+
+def session_metrics(stats, seconds):
+    return {
+        "session_attempts": stats.get("catalog/attempted", 0),
+        "session_responses": stats.get("catalog/downloaded", 0),
+        "session_bytes": stats.get("catalog/bytes", 0),
+        "session_seconds": round(seconds, 3),
+        "http_statuses": {
+            key.rsplit("/", 1)[-1]: count
+            for key, count in stats.items() if key.startswith("catalog/status/")
+        },
+        "http_errors": stats.get("catalog/http_errors", 0),
+        "transport_errors": stats.get("catalog/transport_errors", 0),
+        "logged_errors": stats.get("log_count/ERROR", 0),
+        "retry_at": stats.get("catalog/retry_at"),
+        "http_503": stats.get("catalog/http_503"),
+    }
 
 
 def retry_time(header):
@@ -204,8 +222,31 @@ class AccessGuard:
     def downloaded_response(self, response, request, spider=None):
         self.crawler.stats.inc_value("catalog/downloaded")
         self.crawler.stats.inc_value("catalog/bytes", len(response.body))
+        self.crawler.stats.inc_value(f"catalog/status/{response.status}")
+        if response.status >= 400:
+            self.crawler.stats.inc_value("catalog/http_errors")
 
     def process_response(self, request, response):
+        if response.status == 503:
+            url = urlsplit(request.url)
+            content_type = response.headers.get("Content-Type", b"").decode("ascii", errors="replace")
+            retry_after = response.headers.get("Retry-After")
+            diagnostic = {
+                "path": url.path,
+                "content_type": content_type,
+                "retry_after": retry_after.decode("ascii", errors="replace") if retry_after else None,
+            }
+            if url.netloc in {"carhubauto.ru", "satauto.ru"} and "application/json" in content_type.lower():
+                try:
+                    payload = json.loads(response.body)
+                except (ValueError, UnicodeError):
+                    payload = {}
+                if isinstance(payload, dict):
+                    diagnostic["message"] = {
+                        key: payload[key][:240] for key in ("error", "detail", "message")
+                        if isinstance(payload.get(key), str)
+                    }
+            self.crawler.stats.set_value("catalog/http_503", diagnostic)
         if request.url.endswith("/robots.txt") and response.status not in {200, 404, 410}:
             self.crawler.stats.set_value("catalog/diagnostic", f"robots_http_{response.status}")
             self.crawler.stats.set_value("catalog/retry_at", retry_time(response.headers.get("Retry-After")))
@@ -213,6 +254,7 @@ class AccessGuard:
         return response
 
     def process_exception(self, request, exception):
+        self.crawler.stats.inc_value("catalog/transport_errors")
         if request.url.endswith("/robots.txt"):
             self.crawler.stats.set_value("catalog/diagnostic", "robots_unavailable")
             return TextResponse(request.url, body=b"User-agent: *\nDisallow: /\n", encoding="utf-8")

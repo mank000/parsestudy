@@ -10,7 +10,7 @@ from defusedxml.ElementTree import fromstring
 from defusedxml.common import DefusedXmlException
 from scrapy.crawler import CrawlerProcess
 
-from .spider import CatalogSpider, retry_time
+from .spider import CatalogSpider, retry_time, session_metrics
 
 
 BASE = "https://satauto.ru"
@@ -127,6 +127,9 @@ def run_sitemap(path, shards, origin=BASE, db=None):
     output["response_body_bytes"] = stats.get("catalog/bytes", 0)
     output["seconds"] = round(perf_counter() - start, 3)
     output["retry_at"] = stats.get("catalog/retry_at")
+    metrics = session_metrics(stats, 0)
+    output.update({key: metrics[key] for key in
+                   ("http_statuses", "http_errors", "transport_errors", "logged_errors", "http_503")})
     payload = json.dumps(output, ensure_ascii=False, indent=2, default=str)
     print(payload)
     if path:

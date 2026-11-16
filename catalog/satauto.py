@@ -9,7 +9,7 @@ from psycopg.types.json import Jsonb
 from scrapy.crawler import CrawlerProcess
 
 from .sitemap import BASE, CAR, COUNTRY_CODES
-from .spider import CatalogSpider, retry_time
+from .spider import CatalogSpider, retry_time, session_metrics
 from .store import insert_vehicles
 
 
@@ -41,7 +41,8 @@ def card_from_html(response, article):
                     "mileage_km": next((integer(p) for p in meta if p.endswith("км")), None),
                     "sell_status": article.attrib.get("data-availability-state") or None},
         "specs": {"fuel_type": fuel, "drive_type": next((p for p in meta if p in {"Передний", "Задний", "Полный"}), None)},
-        "pricing": {"presentation": {"amount_rub": integer(price) if "₽" in price else None, "label": price}},
+        "pricing": {"presentation": {"amount_rub": integer(price) if "₽" in price else None,
+                                     "label": price, "kind": "on_request" if "запрос" in price.lower() else None}},
         "links": {"detail": response.urljoin(path)},
         "media": {"main_photo": response.urljoin(photo) if photo else None,
                   "listing_photos": [{"url": response.urljoin(url)} for url in (json.loads(gallery) if gallery else [])]},
@@ -136,7 +137,7 @@ class SatautoSpider(CatalogSpider):
             yield request
 
 
-def run_public_html(db, detail_limit, root_only, enrich=False, make=None):
+def run_public_html(db, detail_limit, root_only, enrich=False, make=None, output=None):
     lock = db.execute("SELECT pg_try_advisory_lock(274811)").fetchone()[0]
     if not lock:
         raise ValueError("Сбор публичных страниц уже запущен")
@@ -167,6 +168,11 @@ def run_public_html(db, detail_limit, root_only, enrich=False, make=None):
         INSERT INTO crawl_run (origin,mode,page_limit)
         VALUES ('https://satauto.ru','listing',24) RETURNING id
         """).fetchone()[0]
+    counts_sql = """
+        SELECT count(*) FILTER (WHERE NOT coalesce(summary ? 'index_only', false)), count(detail)
+        FROM vehicle WHERE run_id=%s
+    """
+    before_records, before_details = db.execute(counts_sql, (run_id,)).fetchone()
     process = CrawlerProcess({"LOG_LEVEL": "WARNING", "LOGSTATS_INTERVAL": 0})
     crawler = process.create_crawler(SatautoSpider)
     started = perf_counter()
@@ -175,9 +181,7 @@ def run_public_html(db, detail_limit, root_only, enrich=False, make=None):
     stats = crawler.stats.get_stats()
     elapsed = perf_counter() - started
     reason = stats.get("catalog/diagnostic") or stats.get("finish_reason")
-    records, details = db.execute(
-        "SELECT count(*) FILTER (WHERE NOT coalesce(summary ? 'index_only', false)),count(detail) FROM vehicle WHERE run_id=%s", (run_id,)
-    ).fetchone()
+    records, details = db.execute(counts_sql, (run_id,)).fetchone()
     attempts = stats.get("catalog/attempted", 0)
     db.execute("""
         UPDATE crawl_run SET status=%s, diagnostic=%s, finished_at=clock_timestamp(),
@@ -187,6 +191,11 @@ def run_public_html(db, detail_limit, root_only, enrich=False, make=None):
         """, ("partial" if records else "failed", "public_html_sample" if reason == "finished" else reason,
               attempts, stats.get("catalog/downloaded", 0), stats.get("catalog/bytes", 0), elapsed,
               stats.get("catalog/retry_at"), run_id))
-    print(json.dumps({"run_id": run_id, "records": records, "details": details, "attempts": attempts,
-                      "seconds": round(elapsed, 3), "reason": reason}))
+    metrics = {"run_id": run_id, "records": records, "details": details,
+               "new_records": records - before_records, "new_details": details - before_details,
+               "reason": reason, **session_metrics(stats, elapsed)}
+    payload = json.dumps(metrics, ensure_ascii=False, indent=2, default=str) + "\n"
+    print(payload, end="")
+    if output:
+        output.write_text(payload, encoding="utf-8")
     return 0 if records and reason == "finished" and not stats.get("log_count/ERROR") else 1

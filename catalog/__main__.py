@@ -14,7 +14,7 @@ from scrapy.crawler import CrawlerProcess
 from .report import render_report
 from .satauto import run_public_html
 from .sitemap import run_sitemap
-from .spider import PUBLIC_ORIGIN, CatalogSpider
+from .spider import PUBLIC_ORIGIN, CatalogSpider, session_metrics
 from .store import import_export, initialize
 
 
@@ -43,6 +43,7 @@ def arguments():
     public.add_argument("--enrich", action="store_true", help="Загрузить недостающие карточки из sitemap")
     public.add_argument("--make", help="Марка в sitemap, например bmw или mercedes-benz")
     public.add_argument("--details", type=int, choices=range(0, 97), metavar="0–96", default=24)
+    public.add_argument("--output", type=Path)
     commands.add_parser("init")
     args = parser.parse_args()
     if args.action == "public-html" and args.make and not args.enrich:
@@ -138,8 +139,7 @@ def run_crawl(db, args):
     metrics = {
         "run_id": run_id, "status": status, "reason": reason, "records": total,
         "details": details, "detail_missing": missing, "pages": saved["pages"],
-        "session_attempts": attempted, "session_responses": downloaded, "session_bytes": transfer,
-        "session_seconds": round(seconds, 3), "retry_at": stats.get("catalog/retry_at"),
+        **session_metrics(stats, seconds),
     }
     output = json.dumps(metrics, ensure_ascii=False, indent=2, default=str)
     print(output)
@@ -162,7 +162,7 @@ def main():
                 with db.transaction():
                     return run_sitemap(args.output, None, db=db)
             if args.action == "public-html":
-                return run_public_html(db, args.details, args.root_only, args.enrich, args.make)
+                return run_public_html(db, args.details, args.root_only, args.enrich, args.make, args.output)
             if args.action == "crawl":
                 return run_crawl(db, args)
             if args.action == "import-export":
