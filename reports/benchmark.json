@@ -1,0 +1,15 @@
+{
+  "run_id": 1,
+  "status": "complete",
+  "reason": "finished",
+  "records": 1000,
+  "details": 0,
+  "detail_missing": 0,
+  "pages": 10,
+  "session_attempts": 11,
+  "session_responses": 11,
+  "session_bytes": 396576,
+  "session_seconds": 11.211,
+  "retry_at": null,
+  "source": "synthetic localhost fixture"
+}

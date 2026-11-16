@@ -1,0 +1,14 @@
+{
+  "run_id": 1,
+  "status": "failed",
+  "reason": "http_500",
+  "records": 0,
+  "details": 0,
+  "detail_missing": 0,
+  "pages": 0,
+  "session_attempts": 2,
+  "session_responses": 2,
+  "session_bytes": 12661,
+  "session_seconds": 6.025,
+  "retry_at": null
+}

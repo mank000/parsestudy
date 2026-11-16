@@ -1,0 +1,22 @@
+{
+  "index": "https://satauto.ru/sitemap-cars.xml",
+  "shards_advertised": 125,
+  "shards_downloaded": 125,
+  "url_entries": 1241721,
+  "unrecognized_urls": 0,
+  "duplicate_country_ids": 0,
+  "country_counts": {
+    "china": 661469,
+    "korea": 534994,
+    "japan": 45258
+  },
+  "unique_ids": 1241721,
+  "reason": "finished",
+  "complete": true,
+  "stored": 1241721,
+  "attempts": 127,
+  "responses": 127,
+  "response_body_bytes": 170903733,
+  "seconds": 155.939,
+  "retry_at": null
+}

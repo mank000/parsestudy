@@ -1,0 +1,14 @@
+{
+  "run_id": 6,
+  "status": "partial",
+  "reason": "page_budget",
+  "records": 300,
+  "details": 0,
+  "detail_missing": 0,
+  "pages": 3,
+  "session_attempts": 4,
+  "session_responses": 4,
+  "session_bytes": 103803,
+  "session_seconds": 5.285,
+  "retry_at": null
+}
