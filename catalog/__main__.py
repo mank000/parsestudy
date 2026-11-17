@@ -18,6 +18,9 @@ from .spider import PUBLIC_ORIGIN, CatalogSpider, session_metrics
 from .store import import_export, initialize
 
 
+PUBLIC_PAGE_BUDGET = 3
+
+
 def arguments():
     parser = argparse.ArgumentParser(prog="python -m catalog")
     commands = parser.add_subparsers(dest="action", required=True)
@@ -76,7 +79,7 @@ def run_crawl(db, args):
     if (not url.hostname or url.username or url.password or url.path or url.query or url.fragment
             or not (url.scheme == "https" or (url.scheme == "http" and url.hostname == "127.0.0.1"))):
         raise ValueError("Нужен HTTPS-адрес согласованного API или локальный HTTP для теста")
-    if public and (args.full or args.resume or args.pages is not None and args.pages > 3):
+    if public and (args.full or args.pages is not None and args.pages > PUBLIC_PAGE_BUDGET):
         raise ValueError("Публичный режим поддерживает пробу до 3 страниц. Для полной выгрузки используйте согласованный источник или импорт.")
     budget = (args.pages or 1) if public else args.pages
     token = os.getenv("CATALOG_API_TOKEN") if not public else None
@@ -98,6 +101,11 @@ def run_crawl(db, args):
     run = get_run(db, run_id)
     if run["origin"] != origin or run["status"] not in {"running", "partial", "failed"}:
         raise ValueError("Продолжить можно незавершённый прогон на том же источнике")
+    if public and args.resume:
+        remaining = PUBLIC_PAGE_BUDGET - run["pages"]
+        if remaining <= 0 or run["mode"] != "listing":
+            raise ValueError("Лимит публичной пробы исчерпан. Для полной выгрузки используйте согласованный источник или импорт.")
+        budget = min(remaining, args.pages or remaining)
     cooldown = db.execute(
         "SELECT max(retry_at) FROM crawl_run WHERE origin=%s", (origin,),
     ).fetchone()[0]

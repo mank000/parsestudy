@@ -10,7 +10,7 @@ from defusedxml.ElementTree import fromstring
 from defusedxml.common import DefusedXmlException
 from scrapy.crawler import CrawlerProcess
 
-from .spider import CatalogSpider, retry_time, session_metrics
+from .spider import CatalogSpider, response_retry_at, session_metrics
 
 
 BASE = "https://satauto.ru"
@@ -35,7 +35,7 @@ class SitemapAudit(CatalogSpider):
 
     def xml(self, response, root_tag):
         if response.status != 200:
-            self.stop(f"http_{response.status}", retry_time(response.headers.get("Retry-After")))
+            self.stop(f"http_{response.status}", response_retry_at(response))
         try:
             root = fromstring(response.body)
         except (ParseError, DefusedXmlException):
@@ -129,7 +129,8 @@ def run_sitemap(path, shards, origin=BASE, db=None):
     output["retry_at"] = stats.get("catalog/retry_at")
     metrics = session_metrics(stats, 0)
     output.update({key: metrics[key] for key in
-                   ("http_statuses", "http_errors", "transport_errors", "logged_errors", "http_503")})
+                   ("http_statuses", "http_errors", "transport_errors", "logged_errors",
+                    "http_503", "retries_503", "recoveries_503")})
     payload = json.dumps(output, ensure_ascii=False, indent=2, default=str)
     print(payload)
     if path:

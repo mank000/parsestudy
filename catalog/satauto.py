@@ -9,7 +9,7 @@ from psycopg.types.json import Jsonb
 from scrapy.crawler import CrawlerProcess
 
 from .sitemap import BASE, CAR, COUNTRY_CODES
-from .spider import CatalogSpider, retry_time, session_metrics
+from .spider import CatalogSpider, response_retry_at, session_metrics
 from .store import insert_vehicles
 
 
@@ -75,7 +75,7 @@ class SatautoSpider(CatalogSpider):
 
     def validate(self, response):
         if response.status != 200:
-            self.stop(f"http_{response.status}", retry_time(response.headers.get("Retry-After")))
+            self.stop(f"http_{response.status}", response_retry_at(response))
 
     def parse_list(self, response):
         self.validate(response)

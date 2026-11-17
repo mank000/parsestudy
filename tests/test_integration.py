@@ -9,6 +9,7 @@ import unittest
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from time import monotonic
 from urllib.parse import parse_qs, urlsplit
 
 import psycopg
@@ -43,9 +44,11 @@ class ApiFixture(BaseHTTPRequestHandler):
         if url.path == "/robots.txt":
             body = self.server.robots.encode()
             status = self.server.robots_status
+            if self.server.robots_fails_once:
+                status = 503 if self.server.requests[self.path] == 1 else 200
             content_type = "text/plain"
             if status == 503:
-                extra["Retry-After"] = "60"
+                extra["Retry-After"] = self.server.robots_retry_after
         elif url.path == "/api/v2/cars":
             content_type = "application/json"
             if self.server.block:
@@ -95,6 +98,8 @@ class CatalogIntegration(unittest.TestCase):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), ApiFixture)
         self.server.robots = "User-agent: *\nAllow: /\n"
         self.server.robots_status = 200
+        self.server.robots_retry_after = "180"
+        self.server.robots_fails_once = False
         self.server.requests = Counter()
         self.server.block = self.server.repeat = False
         self.server.page_cursor = "fixture"
@@ -106,10 +111,14 @@ class CatalogIntegration(unittest.TestCase):
         self.server.server_close()
         self.thread.join()
 
-    def cli(self, *args, code=0):
+    def cli(self, *args, code=0, public=False):
         origin = f"http://127.0.0.1:{self.server.server_port}"
+        entry = ["-m", "catalog"]
+        if public:
+            entry = ["-c", "import sys; import catalog.__main__ as cli; "
+                     "cli.PUBLIC_ORIGIN = sys.argv.pop(1); raise SystemExit(cli.main())", origin]
         result = subprocess.run(
-            [sys.executable, "-m", "catalog", *args],
+            [sys.executable, *entry, *args],
             env={**os.environ, "DATABASE_URL": self.dsn, "CATALOG_API_ORIGIN": origin},
             capture_output=True, text=True, timeout=35,
         )
@@ -227,11 +236,71 @@ class CatalogIntegration(unittest.TestCase):
         self.assertEqual(metrics["reason"], "robots_http_503")
         self.assertEqual(metrics["http_statuses"], {"503": 1})
         self.assertEqual(metrics["http_errors"], 1)
-        self.assertEqual(metrics["http_503"], {
-            "path": "/robots.txt", "content_type": "text/plain", "retry_after": "60",
-        })
+        self.assertEqual(metrics["http_503"]["path"], "/robots.txt")
+        self.assertEqual(metrics["http_503"]["retry_after"], "180")
+        self.assertEqual(metrics["retries_503"], 0)
         self.assertIsNotNone(metrics["retry_at"])
         self.assertEqual(dict(self.server.requests), {"/robots.txt": 1})
+
+    def test_robots_retry_checks_rules_before_api_request(self):
+        self.server.robots_fails_once = True
+        self.server.robots_retry_after = "1"
+        self.server.robots = "User-agent: *\nDisallow: /api/\n"
+        metrics = json.loads(self.cli("crawl", code=1))
+        self.assertEqual(metrics["reason"], "robots_denied")
+        self.assertEqual(metrics["http_statuses"], {"503": 1, "200": 1})
+        self.assertEqual(metrics["recoveries_503"], 1)
+        self.assertEqual(dict(self.server.requests), {"/robots.txt": 2})
+
+    def test_503_retries_same_cursor_and_completes_five_pages(self):
+        request_times = []
+
+        class FivePageFixture(ApiFixture):
+            def do_GET(self):
+                url = urlsplit(self.path)
+                if url.path != "/api/v2/cars":
+                    return super().do_GET()
+                self.server.requests[self.path] += 1
+                page = int(parse_qs(url.query).get("cursor", ["1"])[0])
+                if page == 3:
+                    request_times.append(monotonic())
+                if page == 3 and self.server.requests[self.path] == 1:
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Retry-After", "2")
+                    self.end_headers()
+                    self.wfile.write(b'{"detail": "Temporarily unavailable"}')
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "data": [vehicle(page)],
+                    "pagination": {"has_more": page < 5, "next_cursor": str(page + 1)},
+                }).encode())
+
+        self.server.RequestHandlerClass = FivePageFixture
+        metrics = json.loads(self.cli("crawl"))
+        self.assertEqual((metrics["status"], metrics["records"], metrics["pages"]), ("complete", 5, 5))
+        self.assertEqual(metrics["http_statuses"], {"503": 1, "200": 6})
+        self.assertEqual(metrics["retries_503"], 1)
+        self.assertEqual(metrics["recoveries_503"], 1)
+        self.assertEqual(metrics["http_503"]["next_status"], 200)
+        self.assertGreaterEqual(request_times[1] - request_times[0], 2)
+        self.assertEqual(self.server.requests["/api/v2/cars?limit=100&cursor=2"], 1)
+
+    def test_public_resume_keeps_saved_cursor_and_total_budget(self):
+        self.server.repeat = True
+        first = json.loads(self.cli("crawl", "--pages", "1", public=True))
+        self.server.page_cursor = "another"
+        second = json.loads(self.cli("crawl", "--resume", str(first["run_id"]), "--pages", "1", public=True))
+        self.server.page_cursor = "last"
+        third = json.loads(self.cli("crawl", "--resume", str(first["run_id"]), public=True))
+        self.assertEqual([first["pages"], second["pages"], third["pages"]], [1, 2, 3])
+        self.assertEqual(third["reason"], "page_budget")
+        before = dict(self.server.requests)
+        self.cli("crawl", "--resume", str(first["run_id"]), public=True, code=1)
+        self.assertEqual(dict(self.server.requests), before)
 
     def test_repeat_cursor_rolls_back_page(self):
         self.server.repeat = True
