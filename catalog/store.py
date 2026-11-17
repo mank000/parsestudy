@@ -1,7 +1,16 @@
+import gzip
 import json
 from pathlib import Path
 
+from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
+
+
+VEHICLE_COLUMNS = """
+    run_id, car_id, country, manufacturer, model, year, mileage_km,
+    fuel, power_hp, sell_status, listing_price, currency, listing_rub,
+    status_price, total_rub, estimated_rub, known_rub, summary
+"""
 
 
 def fields(car):
@@ -30,12 +39,9 @@ def insert_vehicles(db, run_id, cars):
     rows = [(run_id, *fields(car), Jsonb(car)) for car in cars]
     with db.cursor() as cursor:
         cursor.executemany(
-            """
-            INSERT INTO vehicle (
-                run_id, car_id, country, manufacturer, model, year, mileage_km,
-                fuel, power_hp, sell_status, listing_price, currency, listing_rub,
-                status_price, total_rub, estimated_rub, known_rub, summary
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            f"""
+            INSERT INTO vehicle ({VEHICLE_COLUMNS})
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (run_id, car_id) DO NOTHING
             """, rows,
         )
@@ -44,40 +50,37 @@ def insert_vehicles(db, run_id, cars):
 
 def import_export(db, path):
     """Import one complete NDJSON export of full CarHub-shaped records atomically."""
-    run_id = db.execute(
-        "INSERT INTO crawl_run (origin, mode, page_limit) VALUES ('export', 'import', 0) RETURNING id"
-    ).fetchone()[0]
-    with path.open(encoding="utf-8") as stream:
-        chunk = []
-        for number, line in enumerate(stream, 1):
-            if not line.strip():
-                continue
-            try:
-                car = json.loads(line)
-                fields(car)
-            except (ValueError, TypeError, AttributeError) as exc:
-                raise ValueError(f"Некорректная строка NDJSON {number}") from exc
-            chunk.append(car)
-            if len(chunk) == 1000:
-                save_export_batch(db, run_id, chunk)
-                chunk.clear()
-        save_export_batch(db, run_id, chunk)
-    if not db.execute("SELECT 1 FROM vehicle WHERE run_id=%s LIMIT 1", (run_id,)).fetchone():
-        raise ValueError("NDJSON-выгрузка пуста")
-    db.execute(
-        """UPDATE crawl_run SET status='complete', listing_done=true,
-           finished_at=clock_timestamp(),
-           seconds=extract(epoch FROM clock_timestamp()-started_at) WHERE id=%s""", (run_id,),
-    )
+    read_export = gzip.open if path.suffix.lower() == ".gz" else open
+    try:
+        with db.transaction(), read_export(path, "rt", encoding="utf-8") as stream:
+            run_id = db.execute(
+                "INSERT INTO crawl_run (origin, mode, page_limit) VALUES ('export', 'import', 0) RETURNING id"
+            ).fetchone()[0]
+            with db.cursor() as cursor:
+                with cursor.copy(f"COPY vehicle ({VEHICLE_COLUMNS}, detail) FROM STDIN") as copy:
+                    for row in export_rows(stream, run_id):
+                        copy.write_row(row)
+                if cursor.rowcount == 0:
+                    raise ValueError("NDJSON-выгрузка пуста")
+            db.execute(
+                """UPDATE crawl_run SET status='complete', listing_done=true,
+                   finished_at=clock_timestamp(),
+                   seconds=extract(epoch FROM clock_timestamp()-started_at) WHERE id=%s""", (run_id,),
+            )
+    except UniqueViolation as exc:
+        raise ValueError("Повторяющийся id в выгрузке") from exc
+    except EOFError as exc:
+        raise ValueError("Файл выгрузки оборван") from exc
     return run_id
 
 
-def save_export_batch(db, run_id, cars):
-    if not cars:
-        return
-    if insert_vehicles(db, run_id, cars) != len(cars):
-        raise ValueError("Повторяющийся id в выгрузке")
-    db.execute(
-        "UPDATE vehicle SET detail=summary WHERE run_id=%s AND car_id=ANY(%s)",
-        (run_id, [car["id"] for car in cars]),
-    )
+def export_rows(stream, run_id):
+    for number, line in enumerate(stream, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            values = fields(json.loads(line))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError(f"Некорректная строка NDJSON {number}") from exc
+        yield run_id, *values, line, line

@@ -1,3 +1,4 @@
+import gzip
 import json
 import os
 import re
@@ -313,9 +314,19 @@ class CatalogIntegration(unittest.TestCase):
             path.write_text("\n".join(json.dumps(vehicle(i)) for i in range(1, 10)), encoding="utf-8")
             run_id = self.cli("import-export", str(path)).strip()
             self.assertIn("90 000", self.cli("report", "--run", run_id))
+            compressed = path.with_suffix(".ndjson.gz")
+            compressed.write_bytes(gzip.compress(path.read_bytes()))
+            zipped_id = self.cli("import-export", str(compressed)).strip()
             with psycopg.connect(self.dsn) as db:
+                self.assertEqual(db.execute(
+                    "SELECT count(*),count(detail) FROM vehicle WHERE run_id=%s", (zipped_id,)
+                ).fetchone(), (9, 9))
                 before = db.execute("SELECT count(*) FROM crawl_run").fetchone()
             path.write_text("\n".join([json.dumps(vehicle(1)), json.dumps(vehicle(1))]), encoding="utf-8")
+            self.cli("import-export", str(path), code=1)
+            path.write_text(json.dumps(vehicle(1)) + "\ninvalid", encoding="utf-8")
+            self.cli("import-export", str(path), code=1)
+            path.write_text("\n", encoding="utf-8")
             self.cli("import-export", str(path), code=1)
             with psycopg.connect(self.dsn) as db:
                 self.assertEqual(db.execute("SELECT count(*) FROM crawl_run").fetchone(), before)

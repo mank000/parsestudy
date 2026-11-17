@@ -174,8 +174,7 @@ def main():
             if args.action == "crawl":
                 return run_crawl(db, args)
             if args.action == "import-export":
-                with db.transaction():
-                    print(import_export(db, args.path))
+                print(import_export(db, args.path))
             if args.action == "report":
                 run = get_run(db, args.run)
                 report = render_report(db, run)
