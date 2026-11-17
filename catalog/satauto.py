@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 from collections import deque
 from datetime import datetime, timezone
 from time import perf_counter
@@ -94,11 +95,16 @@ class SatautoSpider(CatalogSpider):
         with self.db.transaction():
             insert_vehicles(self.db, self.run_id, cars)
             self.db.execute("UPDATE crawl_run SET pages=pages+1 WHERE id=%s", (self.run_id,))
+            pending = {row[0] for row in self.db.execute("""
+                SELECT car_id FROM vehicle WHERE run_id=%s AND car_id=ANY(%s)
+                AND detail IS NULL AND NOT detail_missing
+                """, (self.run_id, [car["id"] for car in cars]))}
         self.pages += 1
         for car in cars:
             if len(self.details) >= self.detail_limit:
                 break
-            self.details[car["links"]["detail"]] = car["id"]
+            if car["id"] in pending:
+                self.details[car["links"]["detail"]] = car["id"]
         request = self.next_request()
         if request:
             yield request
@@ -144,6 +150,7 @@ def run_public_html(db, detail_limit, root_only, enrich=False, make=None, output
     cooldown = db.execute("SELECT max(retry_at) FROM crawl_run WHERE origin=%s", (BASE,)).fetchone()[0]
     if cooldown and cooldown > datetime.now(timezone.utc):
         raise ValueError(f"SATAuto просит повторить после {cooldown.isoformat()}")
+    run, targets = None, None
     if enrich:
         run = db.execute("""
             SELECT id FROM crawl_run WHERE origin=%s AND mode='listing' AND status='partial'
@@ -156,18 +163,20 @@ def run_public_html(db, detail_limit, root_only, enrich=False, make=None, output
                               AND (v.detail IS NOT NULL OR v.detail_missing))
             ORDER BY s.car_id DESC LIMIT %s
             """, (make, make, run[0] if run else None, detail_limit)).fetchall()
-        if not targets:
-            print("Нет необработанных карточек по выбранной марке.")
+        if targets:
+            targets = [(BASE + path, car_id) for path, car_id in reversed(targets) if CAR.fullmatch(path)]
+            if not targets:
+                raise ValueError("Не найдены подходящие адреса карточек")
+        elif make or db.execute("SELECT EXISTS (SELECT 1 FROM sitemap_car)").fetchone()[0]:
+            print("Нет необработанных карточек в индексе. Для обновления индекса выполните ./parse index.")
             return 0
-        targets = [(BASE + path, car_id) for path, car_id in reversed(targets) if CAR.fullmatch(path)]
-        if not targets:
-            raise ValueError("Не найдены подходящие адреса карточек")
-    else:
-        run, targets = None, None
+        else:
+            print("Индекс пока пуст. Начинаю с публичной витрины SATAuto.", file=sys.stderr, flush=True)
+            root_only, targets = True, None
     run_id = run[0] if run else db.execute("""
         INSERT INTO crawl_run (origin,mode,page_limit)
-        VALUES ('https://satauto.ru','listing',24) RETURNING id
-        """).fetchone()[0]
+        VALUES (%s,'listing',24) RETURNING id
+        """, (BASE,)).fetchone()[0]
     counts_sql = """
         SELECT count(*) FILTER (WHERE NOT coalesce(summary ? 'index_only', false)), count(detail)
         FROM vehicle WHERE run_id=%s

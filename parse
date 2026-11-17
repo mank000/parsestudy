@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+cd "$(dirname "$0")"
+case "${1:-}" in
+    -h|--help)
+        cat <<'USAGE'
+./parse                        загрузить до 96 новых карточек SATAuto
+./parse --details 24           ограничить запуск 24 подробными карточками
+./parse --make toyota          выбрать марку из загруженного индекса
+./parse index                 обновить полный индекс адресов SATAuto
+USAGE
+        exit 0
+        ;;
+    index)
+        shift
+        set -- sitemap --all --store "$@"
+        ;;
+    *)
+        set -- public-html --enrich --details 96 "$@"
+        ;;
+esac
+
+if ! docker info >/dev/null 2>&1 && [ "$(uname -s)" = Darwin ]; then
+    docker desktop start >&2
+fi
+docker compose up -d --wait >&2
+exec docker compose run --rm --no-deps -T --volume "$PWD/catalog:/app/catalog:ro" \
+    dashboard python -m catalog "$@"
