@@ -1,5 +1,6 @@
 import json
 import re
+import shutil
 import sys
 from collections import deque
 from datetime import datetime, timezone
@@ -9,7 +10,7 @@ import scrapy
 from psycopg.types.json import Jsonb
 from scrapy.crawler import CrawlerProcess
 
-from .detail_queue import enqueue_details, finish_detail, plan_details, start_detail
+from .detail_queue import enqueue_details, finish_detail, plan_details, plan_full_scan, start_detail
 from .sitemap import BASE, CAR, COUNTRY_CODES
 from .spider import CatalogSpider, response_retry_at, session_metrics
 from .store import fields, insert_vehicles
@@ -54,7 +55,7 @@ def card_from_html(response, article):
 class SatautoSpider(CatalogSpider):
     name = "satauto_public_html"
 
-    def __init__(self, db, run_id, detail_limit, root_only, targets=None):
+    def __init__(self, db, run_id, detail_limit, root_only, targets=None, full_scan=False):
         scrapy.Spider.__init__(self)
         self.db = db
         self.run_id = run_id
@@ -63,6 +64,7 @@ class SatautoSpider(CatalogSpider):
         self.listings = deque(["/catalog/"] if targets is None else [])
         self.details = dict(targets or ())
         self.pages = 0
+        self.full_scan = full_scan
 
     async def start(self):
         if request := self.next_request():
@@ -71,6 +73,16 @@ class SatautoSpider(CatalogSpider):
     def next_request(self):
         if self.listings:
             return scrapy.Request(BASE + self.listings.popleft(), self.parse_list, errback=self.request_failed)
+        if self.full_scan and not self.details:
+            if shutil.disk_usage("/").free < 2 * 1024**3:
+                self.stop("low_disk_space")
+            batch = plan_full_scan(self.db, self.run_id, self.detail_limit, BASE)
+            if any(not CAR.fullmatch(url.removeprefix(BASE)) for url, _ in batch):
+                self.stop("invalid_sitemap_card_url")
+            self.details.update(reversed(batch))
+            if batch:
+                self.logger.warning("Очередь прогона %s · %s карточек · %s",
+                                    self.run_id, len(batch), batch[0][1])
         if self.details:
             url, car_id = self.details.popitem()
             start_detail(self.db, self.run_id, car_id)
@@ -164,7 +176,7 @@ class SatautoSpider(CatalogSpider):
             yield request
 
 
-def run_public_html(db, detail_limit, root_only, enrich=False, make=None, output=None):
+def run_public_html(db, detail_limit, root_only, enrich=False, make=None, output=None, full_scan=False):
     lock = db.execute("SELECT pg_try_advisory_lock(274811)").fetchone()[0]
     if not lock:
         raise ValueError("Сбор публичных страниц уже запущен")
@@ -172,6 +184,11 @@ def run_public_html(db, detail_limit, root_only, enrich=False, make=None, output
     if cooldown and cooldown > datetime.now(timezone.utc):
         raise ValueError(f"SATAuto просит повторить после {cooldown.isoformat()}")
     run, targets = None, None
+    if full_scan:
+        if not db.execute("SELECT pg_try_advisory_lock(274810)").fetchone()[0]:
+            raise ValueError("Индекс SATAuto обновляется. Запустите сбор после обновления.")
+        if not db.execute("SELECT EXISTS (SELECT 1 FROM sitemap_car)").fetchone()[0]:
+            raise ValueError("Загрузите индекс SATAuto командой ./parse index")
     if enrich:
         run = db.execute("""
             SELECT id FROM crawl_run r WHERE origin=%s AND mode='listing'
@@ -182,11 +199,13 @@ def run_public_html(db, detail_limit, root_only, enrich=False, make=None, output
               ))
             ORDER BY id DESC LIMIT 1
             """, (BASE,)).fetchone()
-        targets = plan_details(db, run[0] if run else None, make, detail_limit)
+        targets = [] if full_scan else plan_details(db, run[0] if run else None, make, detail_limit)
         if targets:
             targets = [(BASE + path, car_id) for path, car_id in reversed(targets) if CAR.fullmatch(path)]
             if not targets:
                 raise ValueError("Не найдены подходящие адреса карточек")
+        elif full_scan:
+            targets = []
         elif make or db.execute("SELECT EXISTS (SELECT 1 FROM sitemap_car)").fetchone()[0]:
             print("Нет карточек, готовых к загрузке. Состояние очереди показывает ./parse status.")
             return 0
@@ -207,7 +226,7 @@ def run_public_html(db, detail_limit, root_only, enrich=False, make=None, output
     process = CrawlerProcess({"LOG_LEVEL": "WARNING", "LOGSTATS_INTERVAL": 0})
     crawler = process.create_crawler(SatautoSpider)
     started = perf_counter()
-    process.crawl(crawler, db, run_id, detail_limit, root_only, targets)
+    process.crawl(crawler, db, run_id, detail_limit, root_only, targets, full_scan)
     process.start()
     stats = crawler.stats.get_stats()
     elapsed = perf_counter() - started

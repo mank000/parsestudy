@@ -72,6 +72,15 @@ CREATE TABLE IF NOT EXISTS satauto_detail_task (
     PRIMARY KEY (run_id, car_id)
 );
 
+CREATE TABLE IF NOT EXISTS satauto_scan (
+    run_id bigint PRIMARY KEY REFERENCES crawl_run (id) ON DELETE CASCADE,
+    before_car_id bigint,
+    exhausted boolean NOT NULL DEFAULT false
+);
+
+CREATE INDEX IF NOT EXISTS satauto_detail_ready_idx
+    ON satauto_detail_task (run_id, car_id DESC) WHERE status IN ('pending', 'deferred');
+
 CREATE TABLE IF NOT EXISTS trim_reference (
     source text NOT NULL,
     reference_id text NOT NULL,

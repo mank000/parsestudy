@@ -17,6 +17,7 @@ make parser-run
 | --- | --- |
 | `make parser-run DETAILS=24 BRAND=toyota` | До 24 новых подробных карточек Toyota из сохранённого индекса |
 | `make parser-resume` | Возобновление загрузки SATAuto с сохранёнными задачами |
+| `./parse all` | Обойти подробные карточки всего сохранённого индекса SATAuto в фоне |
 | `make parser-status` | Состояние очереди SATAuto и последние ошибки |
 | `make carhub` | Публичная проба CarHub в пределах трёх страниц |
 | `make trim-build RUN=8` | Справочник комплектаций по сохранённому прогону №8 |

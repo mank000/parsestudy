@@ -2,23 +2,37 @@ from urllib.parse import urlsplit
 
 
 def plan_details(db, run_id, make, limit):
-    queued = db.execute("""
+    queued = queued_details(db, run_id, make, limit)
+    return queued + new_details(db, run_id, make, limit - len(queued))
+
+
+def queued_details(db, run_id, make, limit, max_deferred_attempts=None):
+    return db.execute("""
         SELECT t.path, t.car_id FROM satauto_detail_task t
         LEFT JOIN sitemap_car s ON s.car_id=t.car_id
         WHERE t.run_id=%s AND t.status IN ('pending', 'deferred')
           AND (t.retry_at IS NULL OR t.retry_at <= clock_timestamp())
+          AND (t.status='pending' OR %s::integer IS NULL OR t.attempts<%s)
           AND (%s::text IS NULL OR coalesce(s.make, split_part(t.path, '/', 4))=%s)
           AND NOT EXISTS (
               SELECT 1 FROM vehicle v WHERE v.run_id=t.run_id AND v.car_id=t.car_id
               AND (v.detail IS NOT NULL OR v.detail_missing)
           )
         ORDER BY (t.status='pending') DESC, t.car_id DESC LIMIT %s
-        """, (run_id, make, make, limit)).fetchall()
-    if len(queued) == limit:
-        return queued
-    new = db.execute("""
+        """, (run_id, max_deferred_attempts, max_deferred_attempts, make, make, limit)).fetchall()
+
+
+def new_details(db, run_id, make, limit, before_car_id=None):
+    if not limit:
+        return []
+    position = "AND s.car_id<%s" if before_car_id is not None else ""
+    args = [make, make]
+    if before_car_id is not None:
+        args.append(before_car_id)
+    return db.execute(f"""
         SELECT path, s.car_id FROM sitemap_car s
         WHERE (%s::text IS NULL OR s.make=%s)
+          {position}
           AND NOT EXISTS (
               SELECT 1 FROM vehicle v WHERE v.run_id=%s AND v.car_id=s.car_id
               AND (v.detail IS NOT NULL OR v.detail_missing)
@@ -27,8 +41,28 @@ def plan_details(db, run_id, make, limit):
               SELECT 1 FROM satauto_detail_task t WHERE t.run_id=%s AND t.car_id=s.car_id
           )
         ORDER BY s.car_id DESC LIMIT %s
-        """, (make, make, run_id, run_id, limit - len(queued))).fetchall()
-    return queued + new
+        """, (*args, run_id, run_id, limit)).fetchall()
+
+
+def plan_full_scan(db, run_id, limit, origin):
+    # The position advances in the same transaction that saves the next tasks.
+    with db.transaction():
+        db.execute("INSERT INTO satauto_scan(run_id) VALUES (%s) ON CONFLICT DO NOTHING", (run_id,))
+        before, exhausted = db.execute("""
+            SELECT before_car_id, exhausted FROM satauto_scan WHERE run_id=%s FOR UPDATE
+            """, (run_id,)).fetchone()
+        queued = queued_details(db, run_id, None, limit, max_deferred_attempts=3)
+        new = []
+        remaining = limit - len(queued)
+        if remaining and not exhausted:
+            new = new_details(db, run_id, None, remaining, before)
+            db.execute("""
+                UPDATE satauto_scan SET before_car_id=%s, exhausted=%s WHERE run_id=%s
+                """, (new[-1][1] if new else before, len(new) < remaining, run_id))
+        targets = [(origin + path, car_id) for path, car_id in queued + new]
+        if targets:
+            enqueue_details(db, run_id, targets)
+    return targets
 
 
 def enqueue_details(db, run_id, targets):
@@ -66,6 +100,7 @@ def queue_status(db, origin, run_id=None):
     if run is None and run_id is not None:
         raise ValueError(f"Прогон SATAuto {run_id} не найден")
     run_id = run[0] if run else None
+    scan = db.execute("SELECT before_car_id, exhausted FROM satauto_scan WHERE run_id=%s", (run_id,)).fetchone()
     counts = dict(db.execute("""
         SELECT status, count(*) FROM satauto_detail_task
         WHERE run_id=%s GROUP BY status
@@ -78,6 +113,7 @@ def queue_status(db, origin, run_id=None):
         """, (run_id,)).fetchall()
     return {
         "run_id": run_id,
+        "scan": {"before_car_id": scan[0], "index_exhausted": scan[1]} if scan else None,
         "tasks": {status: counts.get(status, 0) for status in ("pending", "complete", "missing", "deferred")},
         "recent_failures": [
             {"car_id": car_id, "attempts": attempts, "error": error, "retry_at": retry_at}

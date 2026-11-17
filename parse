@@ -2,6 +2,7 @@
 set -eu
 
 cd "$(dirname "$0")"
+background=0
 case "${1:-}" in
     -h|--help)
         cat <<'USAGE'
@@ -10,6 +11,7 @@ case "${1:-}" in
 ./parse --make toyota          выбрать марку из загруженного индекса
 ./parse index                 обновить полный индекс адресов SATAuto
 ./parse status                показать очередь SATAuto
+./parse all                   запустить полный обход SATAuto в фоне
 ./parse carhub                собрать три страницы публичного CarHub
 ./parse init                  запустить каталог и подготовить БД
 USAGE
@@ -22,6 +24,13 @@ USAGE
     status)
         shift
         set -- queue "$@"
+        ;;
+    all)
+        if [ "$#" -ne 1 ]; then
+            printf '%s\n' 'Использование: ./parse all' >&2
+            exit 2
+        fi
+        background=1
         ;;
     carhub)
         shift
@@ -38,4 +47,7 @@ if ! docker info >/dev/null 2>&1 && [ "$(uname -s)" = Darwin ]; then
     docker desktop start >&2
 fi
 docker compose up -d --wait >&2
+if [ "$background" -eq 1 ]; then
+    exec docker compose up -d parser
+fi
 exec docker compose run --rm --no-deps -T dashboard python -m catalog "$@"

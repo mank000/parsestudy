@@ -159,7 +159,9 @@ class CatalogIntegration(unittest.TestCase):
                     (car_id, f"/catalog/japan/toyota/test/{car_id}-toyota/") for car_id in (101, 102, 103)
                 ])
         try:
-            first = json.loads(self.cli("public-html", "--enrich", "--details", "3", satauto=True))
+            first = json.loads(self.cli(
+                "public-html", "--enrich", "--all-details", "--details", "1", satauto=True,
+            ))
             self.assertEqual((first["new_details"], first["deferred_details"], first["missing_details"]), (1, 1, 1))
             queue = json.loads(self.cli("queue", satauto=True))
             self.assertEqual(queue["tasks"], {"pending": 0, "complete": 1, "missing": 1, "deferred": 1})
@@ -171,7 +173,9 @@ class CatalogIntegration(unittest.TestCase):
                 db.execute("UPDATE satauto_detail_task SET retry_at=now() WHERE run_id=%s AND car_id=103",
                            (first["run_id"],))
             self.server.block = False
-            second = json.loads(self.cli("public-html", "--enrich", "--details", "3", satauto=True))
+            second = json.loads(self.cli(
+                "public-html", "--enrich", "--all-details", "--details", "1", satauto=True,
+            ))
             self.assertEqual((second["run_id"], second["new_details"], second["session_attempts"]),
                              (first["run_id"], 1, 2))
             queue = json.loads(self.cli("queue", satauto=True))
@@ -179,6 +183,31 @@ class CatalogIntegration(unittest.TestCase):
         finally:
             with psycopg.connect(self.dsn, autocommit=True) as db:
                 db.execute("DELETE FROM sitemap_car WHERE car_id IN (101,102,103)")
+
+    def test_satauto_full_scan_crosses_batch_boundary_and_keeps_pending_tasks(self):
+        from catalog.detail_queue import finish_detail, plan_full_scan
+        from catalog.store import initialize
+
+        with psycopg.connect(self.dsn, autocommit=True) as db:
+            initialize(db)
+            with db.transaction(force_rollback=True):
+                run_id = db.execute("""
+                    INSERT INTO crawl_run (origin, mode, page_limit)
+                    VALUES ('fixture', 'listing', 1) RETURNING id
+                    """).fetchone()[0]
+                for car_id in (703, 702, 701):
+                    db.execute("INSERT INTO sitemap_car VALUES (%s,'JP','toyota','test','Toyota',%s)",
+                               (car_id, f"/catalog/japan/toyota/test/{car_id}-toyota/"))
+                origin = "https://example.test"
+                first = plan_full_scan(db, run_id, 1, origin)
+                self.assertEqual([car_id for _, car_id in first], [703])
+                self.assertEqual(plan_full_scan(db, run_id, 1, origin), first)
+                for car_id in (703, 702, 701):
+                    self.assertEqual(plan_full_scan(db, run_id, 1, origin)[0][1], car_id)
+                    finish_detail(db, run_id, car_id, "complete")
+                self.assertEqual(plan_full_scan(db, run_id, 1, origin), [])
+                self.assertEqual(db.execute("SELECT before_car_id, exhausted FROM satauto_scan WHERE run_id=%s",
+                                            (run_id,)).fetchone(), (701, True))
 
     def test_trim_reference_enriches_only_missing_verified_technical_fields(self):
         from catalog.inventory import car_html

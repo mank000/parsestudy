@@ -16,11 +16,12 @@ services:
       timeout: 3s
       retries: 20
   dashboard:
+    image: satauto-catalog-study-dashboard
     build: .
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
+    environment: &catalog-database
       DATABASE_URL: postgresql://catalog:catalog-local@postgres:5432/catalog
     ports:
       - "127.0.0.1:8765:8765"
@@ -28,5 +29,17 @@ services:
       - ./catalog:/app/catalog:ro
       - ./reports:/app/reports:ro
     restart: unless-stopped
+  parser:
+    profiles: [full-scan]
+    image: satauto-catalog-study-dashboard
+    pull_policy: never
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: *catalog-database
+    volumes:
+      - ./catalog:/app/catalog:ro
+    command: ["python", "-u", "-m", "catalog", "public-html", "--enrich", "--all-details", "--details", "96"]
 volumes:
   catalog-db:

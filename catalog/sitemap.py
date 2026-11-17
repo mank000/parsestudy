@@ -96,7 +96,8 @@ class SitemapAudit(CatalogSpider):
 
 def run_sitemap(path, shards, origin=BASE, db=None):
     if db is not None:
-        db.execute("SELECT pg_advisory_xact_lock(274810)")
+        if not db.execute("SELECT pg_try_advisory_xact_lock(274810)").fetchone()[0]:
+            raise ValueError("Индекс занят полным обходом или обновлением SATAuto")
         db.execute("CREATE TEMP TABLE sitemap_stage (LIKE sitemap_car) ON COMMIT DROP")
     output = {
         "index": origin + "/sitemap-cars.xml",
@@ -122,6 +123,7 @@ def run_sitemap(path, shards, origin=BASE, db=None):
     if db is not None and output["complete"]:
         db.execute("DELETE FROM sitemap_car")
         output["stored"] = db.execute("INSERT INTO sitemap_car SELECT * FROM sitemap_stage ON CONFLICT DO NOTHING").rowcount
+        db.execute("DELETE FROM satauto_scan")
     output["attempts"] = stats.get("catalog/attempted", 0)
     output["responses"] = stats.get("catalog/downloaded", 0)
     output["response_body_bytes"] = stats.get("catalog/bytes", 0)

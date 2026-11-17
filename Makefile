@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help up down parser-run parser-resume parser-status sitemap carhub trim-build trim-check test
+.PHONY: help up down parser-run parser-resume parser-status parser-all parser-logs parser-stop sitemap carhub trim-build trim-check test
 
 PYTHON ?= .venv/bin/python
 DETAILS ?= 96
@@ -13,6 +13,9 @@ help:
 	  'make parser-run                 загрузить порцию карточек SATAuto' \
 	  'make parser-resume              продолжить очередь SATAuto' \
 	  'make parser-status              посмотреть очередь и причины ошибок' \
+	  'make parser-all                 запустить полный обход SATAuto в фоне' \
+	  'make parser-logs                посмотреть журнал полного обхода' \
+	  'make parser-stop                остановить полный обход' \
 	  'make sitemap                    обновить полный индекс адресов' \
 	  'make carhub                     собрать публичную выборку CarHub' \
 	  'make trim-build RUN=8           построить справочник из прогона' \
@@ -24,13 +27,22 @@ up:
 	./parse init
 
 down:
-	docker compose stop
+	docker compose --profile full-scan stop
 
 parser-run parser-resume:
 	./parse --details "$(DETAILS)" $(if $(BRAND),--make "$(BRAND)")
 
 parser-status:
 	./parse status $(if $(RUN),--run "$(RUN)")
+
+parser-all:
+	./parse all
+
+parser-logs:
+	docker compose logs --tail=30 parser
+
+parser-stop:
+	docker compose stop parser
 
 sitemap:
 	./parse index
