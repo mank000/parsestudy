@@ -9,12 +9,25 @@ case "${1:-}" in
 ./parse --details 24           ограничить запуск 24 подробными карточками
 ./parse --make toyota          выбрать марку из загруженного индекса
 ./parse index                 обновить полный индекс адресов SATAuto
+./parse status                показать очередь SATAuto
+./parse carhub                собрать три страницы публичного CarHub
+./parse init                  запустить каталог и подготовить БД
 USAGE
         exit 0
         ;;
     index)
         shift
         set -- sitemap --all --store "$@"
+        ;;
+    status)
+        shift
+        set -- queue "$@"
+        ;;
+    carhub)
+        shift
+        set -- crawl --pages 3 "$@"
+        ;;
+    init|trim-build|trim-check)
         ;;
     *)
         set -- public-html --enrich --details 96 "$@"
@@ -25,5 +38,4 @@ if ! docker info >/dev/null 2>&1 && [ "$(uname -s)" = Darwin ]; then
     docker desktop start >&2
 fi
 docker compose up -d --wait >&2
-exec docker compose run --rm --no-deps -T --volume "$PWD/catalog:/app/catalog:ro" \
-    dashboard python -m catalog "$@"
+exec docker compose run --rm --no-deps -T dashboard python -m catalog "$@"
