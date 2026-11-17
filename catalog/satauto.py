@@ -5,6 +5,7 @@ import sys
 from collections import deque
 from datetime import datetime, timezone
 from time import perf_counter
+from urllib.parse import urljoin, urlsplit
 
 import scrapy
 from psycopg.types.json import Jsonb
@@ -14,6 +15,9 @@ from .detail_queue import enqueue_details, finish_detail, plan_details, plan_ful
 from .sitemap import BASE, CAR, COUNTRY_CODES
 from .spider import CatalogSpider, response_retry_at, session_metrics
 from .store import fields, insert_vehicles
+
+
+CARD_REDIRECTS = {301, 302, 303, 307, 308}
 
 
 def text(node, selector):
@@ -97,6 +101,34 @@ class SatautoSpider(CatalogSpider):
         if response.status != 200:
             self.stop(f"http_{response.status}", response_retry_at(response))
 
+    def defer_card(self, car_id, reason):
+        finish_detail(self.db, self.run_id, car_id, "deferred", reason)
+        self.crawler.stats.inc_value("catalog/detail_deferred")
+        self.logger.warning("Карточка %s отложена · %s", car_id, reason)
+
+    def follow_card_redirect(self, response, car_id):
+        location = response.headers.get("Location")
+        previous = (*response.meta.get("card_redirect_chain", ()), response.url)
+        if not location:
+            return None
+        try:
+            target = urljoin(response.url, location.decode("latin-1").strip())
+            url = urlsplit(target)
+        except ValueError:
+            return None
+        match = CAR.fullmatch(url.path)
+        if (f"{url.scheme}://{url.netloc}" != BASE or url.query or url.fragment
+                or not match or int(match.group(4)) != car_id
+                or target in previous or len(previous) > 3):
+            return None
+        request = scrapy.Request(target, self.parse_car, errback=self.detail_failed,
+                                 cb_kwargs={"car_id": car_id}, meta={"card_redirect_chain": previous})
+        if request.url in previous:
+            return None
+        enqueue_details(self.db, self.run_id, [(request.url, car_id)])
+        self.crawler.stats.inc_value("catalog/redirects_followed")
+        return request
+
     def parse_list(self, response):
         self.validate(response)
         if self.pages == 0 and not self.root_only:
@@ -134,7 +166,13 @@ class SatautoSpider(CatalogSpider):
             yield request
 
     def parse_car(self, response, car_id):
-        if response.status in {404, 410}:
+        if response.status in CARD_REDIRECTS:
+            request = self.follow_card_redirect(response, car_id)
+            if request:
+                yield request
+                return
+            self.defer_card(car_id, f"http_{response.status}_invalid_card_redirect")
+        elif response.status in {404, 410}:
             with self.db.transaction():
                 insert_vehicles(self.db, self.run_id, [{"id": car_id, "index_only": True}])
                 self.db.execute("UPDATE vehicle SET detail_missing=true WHERE run_id=%s AND car_id=%s",
@@ -162,9 +200,7 @@ class SatautoSpider(CatalogSpider):
                         specs["color"] = colors[0].xpath("normalize-space(.)").get()
                 fields(car)
             except (ValueError, AttributeError, TypeError):
-                finish_detail(self.db, self.run_id, car_id, "deferred", "invalid_html_detail")
-                self.crawler.stats.inc_value("catalog/detail_deferred")
-                self.logger.warning("Карточка %s отложена из-за формата ответа", car_id)
+                self.defer_card(car_id, "invalid_html_detail")
             else:
                 with self.db.transaction():
                     insert_vehicles(self.db, self.run_id, [car])
@@ -245,6 +281,7 @@ def run_public_html(db, detail_limit, root_only, enrich=False, make=None, output
                "new_records": records - before_records, "new_details": details - before_details,
                "deferred_details": stats.get("catalog/detail_deferred", 0),
                "missing_details": stats.get("catalog/detail_missing", 0),
+               "redirects_followed": stats.get("catalog/redirects_followed", 0),
                "reason": reason, **session_metrics(stats, elapsed)}
     payload = json.dumps(metrics, ensure_ascii=False, indent=2, default=str) + "\n"
     print(payload, end="")

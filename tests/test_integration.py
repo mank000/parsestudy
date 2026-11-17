@@ -209,6 +209,52 @@ class CatalogIntegration(unittest.TestCase):
                 self.assertEqual(db.execute("SELECT before_car_id, exhausted FROM satauto_scan WHERE run_id=%s",
                                             (run_id,)).fetchone(), (701, True))
 
+    def test_satauto_follows_same_card_redirect_and_defers_unrelated_target(self):
+        from catalog.store import initialize
+
+        old_path = "/catalog/china/buick/envisionplus/901-buick/"
+        new_path = "/catalog/china/buick/envision-plus/901-buick/"
+        unrelated = "/catalog/china/buick/envisionplus/902-buick/"
+
+        class RedirectFixture(ApiFixture):
+            def do_GET(self):
+                if self.path == "/robots.txt":
+                    return super().do_GET()
+                self.server.requests[self.path] += 1
+                if self.path in {old_path, unrelated}:
+                    self.send_response(301)
+                    self.send_header("Location", new_path if self.path == old_path else "/catalog/")
+                    self.end_headers()
+                elif self.path == new_path:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    raw = json.dumps(vehicle(901))
+                    self.wfile.write(f"<script data-carhub-current-car>{raw}</script>".encode())
+                else:
+                    self.send_error(404)
+
+        self.server.RequestHandlerClass = RedirectFixture
+        with psycopg.connect(self.dsn, autocommit=True) as db:
+            initialize(db)
+            with db.cursor() as cursor:
+                cursor.executemany("INSERT INTO sitemap_car VALUES (%s,'CN','buick','envision','Buick',%s)",
+                                   [(901, old_path), (902, unrelated)])
+        try:
+            result = json.loads(self.cli("public-html", "--enrich", "--details", "2", satauto=True))
+            self.assertEqual((result["new_details"], result["deferred_details"], result["redirects_followed"]),
+                             (1, 1, 1))
+            self.assertEqual(self.server.requests[new_path], 1)
+            self.assertNotIn("/catalog/", self.server.requests)
+            with psycopg.connect(self.dsn) as db:
+                self.assertEqual(db.execute(
+                    "SELECT path,status FROM satauto_detail_task WHERE run_id=%s AND car_id=901",
+                    (result["run_id"],),
+                ).fetchone(), (new_path, "complete"))
+        finally:
+            with psycopg.connect(self.dsn, autocommit=True) as db:
+                db.execute("DELETE FROM sitemap_car WHERE car_id IN (901,902)")
+
     def test_trim_reference_enriches_only_missing_verified_technical_fields(self):
         from catalog.inventory import car_html
         from catalog.store import initialize, insert_vehicles
