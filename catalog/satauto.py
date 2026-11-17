@@ -9,9 +9,10 @@ import scrapy
 from psycopg.types.json import Jsonb
 from scrapy.crawler import CrawlerProcess
 
+from .detail_queue import enqueue_details, finish_detail, plan_details, start_detail
 from .sitemap import BASE, CAR, COUNTRY_CODES
 from .spider import CatalogSpider, response_retry_at, session_metrics
-from .store import insert_vehicles
+from .store import fields, insert_vehicles
 
 
 def text(node, selector):
@@ -64,15 +65,21 @@ class SatautoSpider(CatalogSpider):
         self.pages = 0
 
     async def start(self):
-        yield self.next_request()
+        if request := self.next_request():
+            yield request
 
     def next_request(self):
         if self.listings:
             return scrapy.Request(BASE + self.listings.popleft(), self.parse_list, errback=self.request_failed)
         if self.details:
             url, car_id = self.details.popitem()
-            return scrapy.Request(url, self.parse_car, errback=self.request_failed, cb_kwargs={"car_id": car_id})
+            start_detail(self.db, self.run_id, car_id)
+            return scrapy.Request(url, self.parse_car, errback=self.detail_failed, cb_kwargs={"car_id": car_id})
         return None
+
+    def detail_failed(self, failure):
+        finish_detail(self.db, self.run_id, failure.request.cb_kwargs["car_id"], "pending", failure.type.__name__)
+        self.request_failed(failure)
 
     def validate(self, response):
         if response.status != 200:
@@ -95,16 +102,21 @@ class SatautoSpider(CatalogSpider):
         with self.db.transaction():
             insert_vehicles(self.db, self.run_id, cars)
             self.db.execute("UPDATE crawl_run SET pages=pages+1 WHERE id=%s", (self.run_id,))
-            pending = {row[0] for row in self.db.execute("""
-                SELECT car_id FROM vehicle WHERE run_id=%s AND car_id=ANY(%s)
-                AND detail IS NULL AND NOT detail_missing
+            ready = {row[0] for row in self.db.execute("""
+                SELECT v.car_id FROM vehicle v
+                LEFT JOIN satauto_detail_task t USING (run_id, car_id)
+                WHERE v.run_id=%s AND v.car_id=ANY(%s)
+                  AND v.detail IS NULL AND NOT v.detail_missing
+                  AND (t.status IS NULL OR t.status IN ('pending', 'deferred'))
+                  AND (t.retry_at IS NULL OR t.retry_at <= clock_timestamp())
                 """, (self.run_id, [car["id"] for car in cars]))}
+            for car in cars:
+                if len(self.details) >= self.detail_limit:
+                    break
+                if car["id"] in ready:
+                    self.details[car["links"]["detail"]] = car["id"]
+            enqueue_details(self.db, self.run_id, self.details.items())
         self.pages += 1
-        for car in cars:
-            if len(self.details) >= self.detail_limit:
-                break
-            if car["id"] in pending:
-                self.details[car["links"]["detail"]] = car["id"]
         request = self.next_request()
         if request:
             yield request
@@ -115,8 +127,12 @@ class SatautoSpider(CatalogSpider):
                 insert_vehicles(self.db, self.run_id, [{"id": car_id, "index_only": True}])
                 self.db.execute("UPDATE vehicle SET detail_missing=true WHERE run_id=%s AND car_id=%s",
                                 (self.run_id, car_id))
+                finish_detail(self.db, self.run_id, car_id, "missing", f"http_{response.status}")
+            self.crawler.stats.inc_value("catalog/detail_missing")
         else:
-            self.validate(response)
+            if response.status != 200:
+                finish_detail(self.db, self.run_id, car_id, "pending", f"http_{response.status}")
+                self.validate(response)
             raw = response.css("script[data-carhub-current-car]::text").get()
             try:
                 car = json.loads(raw or "")
@@ -132,12 +148,17 @@ class SatautoSpider(CatalogSpider):
                     )
                     if colors:
                         specs["color"] = colors[0].xpath("normalize-space(.)").get()
+                fields(car)
             except (ValueError, AttributeError, TypeError):
-                self.stop("invalid_html_detail")
-            with self.db.transaction():
-                insert_vehicles(self.db, self.run_id, [car])
-                self.db.execute("UPDATE vehicle SET detail=%s WHERE run_id=%s AND car_id=%s",
-                                (Jsonb(car), self.run_id, car_id))
+                finish_detail(self.db, self.run_id, car_id, "deferred", "invalid_html_detail")
+                self.crawler.stats.inc_value("catalog/detail_deferred")
+                self.logger.warning("Карточка %s отложена из-за формата ответа", car_id)
+            else:
+                with self.db.transaction():
+                    insert_vehicles(self.db, self.run_id, [car])
+                    self.db.execute("UPDATE vehicle SET detail=%s WHERE run_id=%s AND car_id=%s",
+                                    (Jsonb(car), self.run_id, car_id))
+                    finish_detail(self.db, self.run_id, car_id, "complete")
         request = self.next_request()
         if request:
             yield request
@@ -153,22 +174,21 @@ def run_public_html(db, detail_limit, root_only, enrich=False, make=None, output
     run, targets = None, None
     if enrich:
         run = db.execute("""
-            SELECT id FROM crawl_run WHERE origin=%s AND mode='listing' AND status='partial'
+            SELECT id FROM crawl_run r WHERE origin=%s AND mode='listing'
+              AND (status='partial' OR (
+                  status IN ('running', 'failed') AND EXISTS (
+                      SELECT 1 FROM satauto_detail_task t WHERE t.run_id=r.id
+                  )
+              ))
             ORDER BY id DESC LIMIT 1
             """, (BASE,)).fetchone()
-        targets = db.execute("""
-            SELECT path,s.car_id FROM sitemap_car s
-            WHERE (%s::text IS NULL OR make=%s)
-              AND NOT EXISTS (SELECT 1 FROM vehicle v WHERE v.run_id=%s AND v.car_id=s.car_id
-                              AND (v.detail IS NOT NULL OR v.detail_missing))
-            ORDER BY s.car_id DESC LIMIT %s
-            """, (make, make, run[0] if run else None, detail_limit)).fetchall()
+        targets = plan_details(db, run[0] if run else None, make, detail_limit)
         if targets:
             targets = [(BASE + path, car_id) for path, car_id in reversed(targets) if CAR.fullmatch(path)]
             if not targets:
                 raise ValueError("Не найдены подходящие адреса карточек")
         elif make or db.execute("SELECT EXISTS (SELECT 1 FROM sitemap_car)").fetchone()[0]:
-            print("Нет необработанных карточек в индексе. Для обновления индекса выполните ./parse index.")
+            print("Нет карточек, готовых к загрузке. Состояние очереди показывает ./parse status.")
             return 0
         else:
             print("Индекс пока пуст. Начинаю с публичной витрины SATAuto.", file=sys.stderr, flush=True)
@@ -177,6 +197,8 @@ def run_public_html(db, detail_limit, root_only, enrich=False, make=None, output
         INSERT INTO crawl_run (origin,mode,page_limit)
         VALUES (%s,'listing',24) RETURNING id
         """, (BASE,)).fetchone()[0]
+    if targets:
+        enqueue_details(db, run_id, targets)
     counts_sql = """
         SELECT count(*) FILTER (WHERE NOT coalesce(summary ? 'index_only', false)), count(detail)
         FROM vehicle WHERE run_id=%s
@@ -202,6 +224,8 @@ def run_public_html(db, detail_limit, root_only, enrich=False, make=None, output
               stats.get("catalog/retry_at"), run_id))
     metrics = {"run_id": run_id, "records": records, "details": details,
                "new_records": records - before_records, "new_details": details - before_details,
+               "deferred_details": stats.get("catalog/detail_deferred", 0),
+               "missing_details": stats.get("catalog/detail_missing", 0),
                "reason": reason, **session_metrics(stats, elapsed)}
     payload = json.dumps(metrics, ensure_ascii=False, indent=2, default=str) + "\n"
     print(payload, end="")

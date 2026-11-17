@@ -59,3 +59,32 @@ CREATE TABLE IF NOT EXISTS sitemap_car (
     title text NOT NULL,
     path text NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS satauto_detail_task (
+    run_id bigint NOT NULL REFERENCES crawl_run (id) ON DELETE CASCADE,
+    car_id bigint NOT NULL,
+    path text NOT NULL,
+    status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'deferred', 'complete', 'missing')),
+    attempts integer NOT NULL DEFAULT 0,
+    last_error text,
+    retry_at timestamptz,
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (run_id, car_id)
+);
+
+CREATE TABLE IF NOT EXISTS trim_reference (
+    source text NOT NULL,
+    reference_id text NOT NULL,
+    country text NOT NULL CHECK (country = 'CN'),
+    make_key text NOT NULL,
+    model_key text NOT NULL,
+    model_year integer NOT NULL,
+    trim_key text NOT NULL,
+    specs jsonb NOT NULL,
+    source_url text,
+    evidence jsonb NOT NULL DEFAULT '[]'::jsonb,
+    PRIMARY KEY (source, reference_id)
+);
+
+CREATE INDEX IF NOT EXISTS trim_reference_identity_idx
+    ON trim_reference (country, make_key, model_key, model_year, trim_key);

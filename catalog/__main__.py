@@ -11,11 +11,13 @@ import psycopg
 from psycopg.rows import dict_row
 from scrapy.crawler import CrawlerProcess
 
+from .detail_queue import queue_status
 from .report import render_report
-from .satauto import run_public_html
+from .satauto import BASE, run_public_html
 from .sitemap import run_sitemap
 from .spider import PUBLIC_ORIGIN, CatalogSpider, session_metrics
 from .store import import_export, initialize
+from .trims import audit_trims, build_trims, import_trims
 
 
 PUBLIC_PAGE_BUDGET = 3
@@ -47,6 +49,15 @@ def arguments():
     public.add_argument("--make", help="Марка в sitemap, например bmw или mercedes-benz")
     public.add_argument("--details", type=int, choices=range(0, 97), metavar="0–96", default=24)
     public.add_argument("--output", type=Path)
+    queue = commands.add_parser("queue", help="Состояние очереди карточек SATAuto")
+    queue.add_argument("--run", type=int)
+    trim_import = commands.add_parser("trim-import", help="Загрузить справочник комплектаций")
+    trim_import.add_argument("path", type=Path)
+    for name, help_text in (
+        ("trim-build", "Собрать справочник по совпавшим сохранённым объявлениям"),
+        ("trim-check", "Проверить совпадения со справочником в одном прогоне"),
+    ):
+        commands.add_parser(name, help=help_text).add_argument("--run", type=int, required=True)
     commands.add_parser("init")
     args = parser.parse_args()
     if args.action == "public-html" and args.make and not args.enrich:
@@ -175,6 +186,14 @@ def main():
                 return run_crawl(db, args)
             if args.action == "import-export":
                 print(import_export(db, args.path))
+            if args.action == "queue":
+                print(json.dumps(queue_status(db, BASE, args.run), ensure_ascii=False, indent=2, default=str))
+            if args.action == "trim-import":
+                print(import_trims(db, args.path))
+            if args.action in {"trim-build", "trim-check"}:
+                get_run(db, args.run)
+                operation = build_trims if args.action == "trim-build" else audit_trims
+                print(json.dumps(operation(db, args.run), ensure_ascii=False, indent=2))
             if args.action == "report":
                 run = get_run(db, args.run)
                 report = render_report(db, run)

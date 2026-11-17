@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo
 import psycopg
 from psycopg.rows import dict_row
 
+from .trims import SPEC_LABELS, trim_for_card
+
 
 COUNTRIES = {"CN": "Китай", "KR": "Южная Корея", "JP": "Япония"}
 AVAILABILITY = {"active": "В продаже", "sold": "Продано", "inactive": "Снято",
@@ -457,6 +459,7 @@ def vehicle_table(cars, run):
 
 
 def car_html(dsn, run_id, car_id):
+    reference = None
     try:
         with psycopg.connect(dsn, connect_timeout=3, row_factory=dict_row) as db:
             db.read_only = True
@@ -464,9 +467,11 @@ def car_html(dsn, run_id, car_id):
             metadata = METADATA + " AND v.car_id=%s"
             car = db.execute(f"""
                 WITH metadata AS ({metadata})
-                SELECT cars.*, metadata.data->'pricing' AS pricing
+                SELECT cars.*, metadata.data->'pricing' AS pricing, metadata.data AS raw
                 FROM ({VEHICLES}) cars JOIN metadata USING (car_id)
                 """, (run_id, car_id)).fetchone()
+            if car and car["raw"]:
+                reference = trim_for_card(db, car["raw"])
     except psycopg.errors.UndefinedTable:
         car = None
     except psycopg.Error:
@@ -490,12 +495,23 @@ def car_html(dsn, run_id, car_id):
         if isinstance(step, dict) and step.get("label") and type(step.get("amount_rub")) in (int, float)
     ]
     breakdown = f'<details><summary>Статьи расчёта</summary><ul>{"".join(steps)}</ul></details>' if steps else ""
+    reference_html = ""
+    if reference and reference["specs"]:
+        rows = "".join(f'<li>{SPEC_LABELS[key]} · {escape(str(value))}</li>'
+                       for key, value in reference["specs"].items())
+        label = escape(reference["source"])
+        href = safe_url(reference["url"])
+        if type(reference["run_id"]) is int:
+            label += f' · прогон №{reference["run_id"]}'
+            href = f'/analytics?run={reference["run_id"]}#prices'
+        provenance = f'<a href="{escape(href)}">{label}</a>' if href else label
+        reference_html = f'<h3>Из справочника комплектаций</h3><ul>{rows}</ul><p>{provenance}</p>'
     return 200, f"""
       <p><a href="{url_for({"source": origin})}">← Каталог {source}</a></p>
       <h1>{title}</h1><p class="intro">#{car_id} · {source} · прогон #{run_id}</p>
       <section class="panel">
         <h2>Характеристики и цена</h2>
         {vehicle_table([car], run)}
-        {original}{details}{breakdown}{external}
+        {original}{details}{breakdown}{reference_html}{external}
       </section>
     """

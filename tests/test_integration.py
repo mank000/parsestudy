@@ -112,12 +112,15 @@ class CatalogIntegration(unittest.TestCase):
         self.server.server_close()
         self.thread.join()
 
-    def cli(self, *args, code=0, public=False):
+    def cli(self, *args, code=0, public=False, satauto=False):
         origin = f"http://127.0.0.1:{self.server.server_port}"
         entry = ["-m", "catalog"]
         if public:
             entry = ["-c", "import sys; import catalog.__main__ as cli; "
                      "cli.PUBLIC_ORIGIN = sys.argv.pop(1); raise SystemExit(cli.main())", origin]
+        if satauto:
+            entry = ["-c", "import sys; import catalog.satauto as sat; sat.BASE = sys.argv.pop(1); "
+                     "from catalog.__main__ import main; raise SystemExit(main())", origin]
         result = subprocess.run(
             [sys.executable, *entry, *args],
             env={**os.environ, "DATABASE_URL": self.dsn, "CATALOG_API_ORIGIN": origin},
@@ -125,6 +128,101 @@ class CatalogIntegration(unittest.TestCase):
         )
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         return result.stdout
+
+    def test_satauto_queue_defers_bad_card_and_resumes(self):
+        from catalog.store import initialize
+
+        class HtmlFixture(ApiFixture):
+            def do_GET(self):
+                if self.path == "/robots.txt":
+                    return super().do_GET()
+                self.server.requests[self.path] += 1
+                car_id = int(self.path.rsplit("/", 2)[-2].split("-", 1)[0])
+                if car_id == 101:
+                    self.send_error(410)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                if car_id == 103 and self.server.block:
+                    self.wfile.write(b"<p>Unexpected rendering</p>")
+                else:
+                    data = json.dumps(vehicle(car_id))
+                    self.wfile.write(f"<script data-carhub-current-car>{data}</script>".encode())
+
+        self.server.RequestHandlerClass = HtmlFixture
+        self.server.block = True
+        with psycopg.connect(self.dsn, autocommit=True) as db:
+            initialize(db)
+            with db.cursor() as cursor:
+                cursor.executemany("INSERT INTO sitemap_car VALUES (%s,'JP','toyota','test','Toyota',%s)", [
+                    (car_id, f"/catalog/japan/toyota/test/{car_id}-toyota/") for car_id in (101, 102, 103)
+                ])
+        try:
+            first = json.loads(self.cli("public-html", "--enrich", "--details", "3", satauto=True))
+            self.assertEqual((first["new_details"], first["deferred_details"], first["missing_details"]), (1, 1, 1))
+            queue = json.loads(self.cli("queue", satauto=True))
+            self.assertEqual(queue["tasks"], {"pending": 0, "complete": 1, "missing": 1, "deferred": 1})
+            self.assertEqual(queue["recent_failures"][0]["car_id"], 103)
+            requests = dict(self.server.requests)
+            self.cli("public-html", "--enrich", "--details", "3", satauto=True)
+            self.assertEqual(dict(self.server.requests), requests)
+            with psycopg.connect(self.dsn, autocommit=True) as db:
+                db.execute("UPDATE satauto_detail_task SET retry_at=now() WHERE run_id=%s AND car_id=103",
+                           (first["run_id"],))
+            self.server.block = False
+            second = json.loads(self.cli("public-html", "--enrich", "--details", "3", satauto=True))
+            self.assertEqual((second["run_id"], second["new_details"], second["session_attempts"]),
+                             (first["run_id"], 1, 2))
+            queue = json.loads(self.cli("queue", satauto=True))
+            self.assertEqual(queue["tasks"], {"pending": 0, "complete": 2, "missing": 1, "deferred": 0})
+        finally:
+            with psycopg.connect(self.dsn, autocommit=True) as db:
+                db.execute("DELETE FROM sitemap_car WHERE car_id IN (101,102,103)")
+
+    def test_trim_reference_enriches_only_missing_verified_technical_fields(self):
+        from catalog.inventory import car_html
+        from catalog.store import initialize, insert_vehicles
+        from catalog.trims import LOCAL_SOURCE
+
+        source = {"name": "Fixture", "country": "CN"}
+        identity = {"manufacturer": "Toyota", "model": "Reference", "trim": "2.0 CVT"}
+        with psycopg.connect(self.dsn, autocommit=True) as db:
+            initialize(db)
+            run = db.execute("INSERT INTO crawl_run(origin,mode,page_limit) VALUES ('fixture','listing',3) RETURNING id").fetchone()[0]
+            cars = []
+            for car_id in (401, 402, 403):
+                car = vehicle(car_id)
+                car["source"] = {**source, "listing_id": str(car_id)}
+                car["identity"] = identity
+                car["specs"] = {"engine_power_hp": 150, "transmission": "CVT"}
+                cars.append(car)
+            cars[2]["specs"].pop("transmission")
+            insert_vehicles(db, run, cars)
+        result = json.loads(self.cli("trim-build", "--run", str(run)))
+        self.assertEqual(result["references"], 1)
+        checked = json.loads(self.cli("trim-check", "--run", str(run)))
+        self.assertEqual((checked["matched"], checked["can_enrich"]), (3, 1))
+        with psycopg.connect(self.dsn, autocommit=True) as db:
+            db.execute("DELETE FROM trim_reference WHERE source=%s", (LOCAL_SOURCE,))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "specs.ndjson"
+            reference = {**cars[0], "reference_source": "Учебный справочник", "reference_id": "example-1"}
+            reference["specs"] = {**reference["specs"], "color": "Синий", "total_rub": 99}
+            path.write_text(json.dumps(reference), encoding="utf-8")
+            self.assertEqual(self.cli("trim-import", str(path)).strip(), "1")
+            checked = json.loads(self.cli("trim-check", "--run", str(run)))
+            self.assertEqual((checked["matched"], checked["can_enrich"]), (3, 1))
+            status, page = car_html(self.dsn, run, 403)
+            self.assertEqual(status, 200)
+            self.assertIn("Коробка передач · CVT", page)
+            self.assertIn("Учебный справочник", page)
+            self.assertNotIn("Синий", page)
+            other = {**reference, "reference_id": "example-2"}
+            path.write_text(json.dumps(other), encoding="utf-8")
+            self.cli("trim-import", str(path))
+            checked = json.loads(self.cli("trim-check", "--run", str(run)))
+            self.assertEqual((checked["ambiguous"], checked["can_enrich"]), (3, 0))
 
     def test_inventory_filters_and_price_analytics(self):
         from psycopg.rows import dict_row
