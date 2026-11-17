@@ -78,6 +78,11 @@ CREATE TABLE IF NOT EXISTS satauto_scan (
     exhausted boolean NOT NULL DEFAULT false
 );
 
+CREATE TABLE IF NOT EXISTS satauto_lot_id (
+    source_id text PRIMARY KEY,
+    car_id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100000000000000000) UNIQUE
+);
+
 CREATE INDEX IF NOT EXISTS satauto_detail_ready_idx
     ON satauto_detail_task (run_id, car_id DESC) WHERE status IN ('pending', 'deferred');
 

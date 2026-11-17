@@ -47,6 +47,7 @@ def arguments():
     public.add_argument("--root-only", action="store_true")
     public.add_argument("--enrich", action="store_true", help="Загрузить недостающие карточки из sitemap")
     public.add_argument("--all-details", action="store_true", help="Обойти сохранённый индекс целиком")
+    public.add_argument("--list-only", action="store_true", help="Сохранить публичную выдачу без запросов карточек")
     public.add_argument("--make", help="Марка в sitemap, например bmw или mercedes-benz")
     public.add_argument("--details", type=int, choices=range(0, 97), metavar="0–96", default=24)
     public.add_argument("--output", type=Path)
@@ -63,6 +64,8 @@ def arguments():
     args = parser.parse_args()
     if args.action == "public-html" and args.make and not args.enrich:
         parser.error("--make используется с --enrich")
+    if args.action == "public-html" and args.list_only and (args.enrich or args.all_details):
+        parser.error("--list-only используется без --enrich и --all-details")
     if args.action == "public-html" and args.all_details and (
         not args.enrich or args.root_only or args.make or not args.details
     ):
@@ -187,7 +190,7 @@ def main():
                     return run_sitemap(args.output, None, db=db)
             if args.action == "public-html":
                 return run_public_html(db, args.details, args.root_only, args.enrich, args.make,
-                                       args.output, full_scan=args.all_details)
+                                       args.output, full_scan=args.all_details, list_only=args.list_only)
             if args.action == "crawl":
                 return run_crawl(db, args)
             if args.action == "import-export":

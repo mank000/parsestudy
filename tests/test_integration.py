@@ -255,6 +255,60 @@ class CatalogIntegration(unittest.TestCase):
             with psycopg.connect(self.dsn, autocommit=True) as db:
                 db.execute("DELETE FROM sitemap_car WHERE car_id IN (901,902)")
 
+    def test_satauto_list_saves_unique_cars_without_requesting_details(self):
+        from catalog.store import initialize, insert_vehicles
+
+        def article(car_id, price):
+            return (
+                f'<article data-car-id="{car_id}" data-availability-state="active">'
+                f'<a class="satauto-car-card__link" href="/catalog/china/toyota/test/{car_id}-toyota/"></a>'
+                '<span class="satauto-car-card__title">Toyota</span>'
+                '<span class="satauto-car-card__meta">2024 · 10 000 км · Бензин · Передний</span>'
+                f'<span class="satauto-car-card__price">{price}</span></article>'
+            )
+
+        class ListingFixture(ApiFixture):
+            def do_GET(self):
+                if self.path == "/robots.txt":
+                    return super().do_GET()
+                self.server.requests[self.path] += 1
+                if self.path == "/catalog/":
+                    links = '<a data-catalog-country href="/catalog/?source_country=CN">Китай</a>'
+                    cards = article(801, "2 000 000 ₽")
+                elif self.path == "/catalog/?source_country=CN":
+                    links = ""
+                    lot = article(802, "Цена по запросу").replace('data-car-id="802"', 'data-car-id="main:Lot802"')
+                    lot = lot.replace("/catalog/china/toyota/test/802-toyota/", "/catalog/japan/lot-main-Lot802/")
+                    cards = article(801, "2 000 000 ₽") + lot + article(0, "")
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(f'{links}<div id="catalog-results">{cards}</div>'.encode())
+
+        self.server.RequestHandlerClass = ListingFixture
+        origin = f"http://127.0.0.1:{self.server.server_port}"
+        with psycopg.connect(self.dsn, autocommit=True) as db:
+            initialize(db)
+            run_id = db.execute("""
+                INSERT INTO crawl_run (origin, mode, page_limit, status)
+                VALUES (%s,'listing',24,'partial') RETURNING id
+                """, (origin,)).fetchone()[0]
+            insert_vehicles(db, run_id, [vehicle(800)])
+            db.execute("UPDATE vehicle SET detail=summary WHERE run_id=%s", (run_id,))
+        result = json.loads(self.cli("public-html", "--list-only", satauto=True))
+        self.assertEqual((result["run_id"], result["new_records"], result["details"]), (run_id, 2, 1))
+        self.assertEqual((result["list_pages"], result["list_records"], result["list_records_priced"]), (2, 2, 1))
+        self.assertEqual(result["list_records_skipped"], 1)
+        self.assertEqual(dict(self.server.requests), {"/robots.txt": 1, "/catalog/": 1, "/catalog/?source_country=CN": 1})
+        with psycopg.connect(self.dsn) as db:
+            self.assertEqual(db.execute("""
+                SELECT v.summary#>>'{source,listing_id}' FROM vehicle v JOIN satauto_lot_id j USING (car_id)
+                WHERE v.run_id=%s
+                """, (run_id,)).fetchone(), ("main:Lot802",))
+
     def test_trim_reference_enriches_only_missing_verified_technical_fields(self):
         from catalog.inventory import car_html
         from catalog.store import initialize, insert_vehicles

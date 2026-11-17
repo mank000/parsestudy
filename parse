@@ -10,6 +10,7 @@ case "${1:-}" in
 ./parse --details 24           ограничить запуск 24 подробными карточками
 ./parse --make toyota          выбрать марку из загруженного индекса
 ./parse index                 обновить полный индекс адресов SATAuto
+./parse list                  сохранить выдачу SATAuto без открытия карточек
 ./parse status                показать очередь SATAuto
 ./parse all                   запустить полный обход SATAuto в фоне
 ./parse logs                  посмотреть журнал полного обхода
@@ -22,6 +23,10 @@ USAGE
     index)
         shift
         set -- sitemap --all --store "$@"
+        ;;
+    list)
+        shift
+        set -- public-html --list-only "$@"
         ;;
     status)
         shift
