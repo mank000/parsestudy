@@ -39,10 +39,10 @@ parser-all:
 	./parse all
 
 parser-logs:
-	docker compose logs --tail=30 parser
+	./parse logs
 
 parser-stop:
-	docker compose stop parser
+	./parse stop
 
 sitemap:
 	./parse index

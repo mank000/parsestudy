@@ -12,6 +12,8 @@ case "${1:-}" in
 ./parse index                 обновить полный индекс адресов SATAuto
 ./parse status                показать очередь SATAuto
 ./parse all                   запустить полный обход SATAuto в фоне
+./parse logs                  посмотреть журнал полного обхода
+./parse stop                  остановить полный обход
 ./parse carhub                собрать три страницы публичного CarHub
 ./parse init                  запустить каталог и подготовить БД
 USAGE
@@ -24,6 +26,14 @@ USAGE
     status)
         shift
         set -- queue "$@"
+        ;;
+    logs)
+        shift
+        exec docker compose logs --tail=30 "$@" parser
+        ;;
+    stop)
+        shift
+        exec docker compose stop "$@" parser
         ;;
     all)
         if [ "$#" -ne 1 ]; then
