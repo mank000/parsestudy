@@ -133,6 +133,10 @@ def database_sections(dsn):
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
+    def log_request(self, code="-", size="-"):
+        if self.path != "/healthz":
+            super().log_request(code, size)
+
     def send_content(self, status, content_type, body):
         content = body.encode("utf-8")
         self.send_response(status)
@@ -145,6 +149,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlsplit(self.path)
+        if url.path == "/healthz":
+            return self.send_content(200, "text/plain", "ok\n")
         if url.path == "/style.css":
             return self.send_content(200, "text/css", (ASSETS / "style.css").read_text(encoding="utf-8"))
         if url.path == "/filters.js":

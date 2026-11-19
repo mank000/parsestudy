@@ -3,3 +3,5 @@ __pycache__/
 .env
 .api.env
 .api-credentials
+.DS_Store
+PROMPT.md

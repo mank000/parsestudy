@@ -7,16 +7,16 @@ services:
       POSTGRES_USER: catalog
       POSTGRES_PASSWORD: catalog-local
     ports:
-      - "127.0.0.1:55432:5432"
+      - "127.0.0.1:${CATALOG_DB_PORT:-55432}:5432"
     volumes:
       - catalog-db:/var/lib/postgresql/data
     healthcheck:
-      test: [CMD-SHELL, pg_isready -U catalog -d catalog]
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, catalog, -d, catalog]
       interval: 2s
       timeout: 3s
       retries: 20
   dashboard:
-    image: satauto-catalog-study-dashboard
+    image: ${COMPOSE_PROJECT_NAME}-dashboard
     build: .
     depends_on:
       postgres:
@@ -24,17 +24,20 @@ services:
     environment: &catalog-database
       DATABASE_URL: postgresql://catalog:catalog-local@postgres:5432/catalog
     ports:
-      - "127.0.0.1:8765:8765"
-    volumes:
-      - ./catalog:/app/catalog:ro
-      - ./reports:/app/reports:ro
+      - "127.0.0.1:${CATALOG_WEB_PORT:-8765}:8765"
+    healthcheck:
+      test: [CMD, python, -c, "from urllib.request import urlopen; urlopen('http://127.0.0.1:8765/healthz', timeout=2).close()"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 2m
     restart: unless-stopped
   api:
     profiles: [api]
-    image: satauto-catalog-study-dashboard
-    build: .
+    image: ${COMPOSE_PROJECT_NAME}-dashboard
+    pull_policy: never
     depends_on:
-      postgres:
+      dashboard:
         condition: service_healthy
     environment:
       <<: *catalog-database
@@ -42,20 +45,18 @@ services:
       - path: .api.env
         required: false
     ports:
-      - "127.0.0.1:8766:8766"
-    volumes:
-      - ./catalog:/app/catalog:ro
+      - "127.0.0.1:${CATALOG_API_PORT:-8766}:8766"
     command: ["uvicorn", "catalog.api:app", "--host", "0.0.0.0", "--port", "8766"]
     restart: unless-stopped
   parser:
     profiles: [full-scan]
-    image: satauto-catalog-study-dashboard
+    image: ${COMPOSE_PROJECT_NAME}-dashboard
     pull_policy: never
     init: true
     restart: on-failure
     stop_grace_period: 35s
     depends_on:
-      postgres:
+      dashboard:
         condition: service_healthy
     environment:
       <<: *catalog-database
@@ -64,8 +65,6 @@ services:
       SATAUTO_YEAR_MIN: ${SATAUTO_YEAR_MIN:-}
       SATAUTO_YEAR_MAX: ${SATAUTO_YEAR_MAX:-}
       SATAUTO_WORKERS: ${SATAUTO_WORKERS:-6}
-    volumes:
-      - ./catalog:/app/catalog:ro
     command: ["python", "-u", "-m", "catalog.sync"]
 volumes:
   catalog-db:

@@ -24,6 +24,8 @@ case "${1:-}" in
 ./parse stop                  остановить полный обход
 ./parse carhub                собрать три страницы публичного CarHub
 ./parse init                  запустить каталог и подготовить БД
+./parse demo                  открыть каталог с синтетическими данными на порту 8775
+./parse demo-stop             остановить демонстрационный каталог
 USAGE
         exit 0
         ;;
@@ -105,7 +107,7 @@ USAGE
         shift
         set -- crawl --pages 3 "$@"
         ;;
-    init|trim-build|trim-check)
+    init|demo|demo-stop|trim-build|trim-check)
         ;;
     --country|--year|--year-min|--year-max|--pages|--restart|--workers)
         set -- satauto-api "$@"
@@ -118,7 +120,22 @@ esac
 if ! docker info >/dev/null 2>&1 && [ "$(uname -s)" = Darwin ]; then
     docker desktop start >&2
 fi
-docker compose up -d --wait >&2
+case "${1:-}" in
+    init)
+        exec docker compose up -d --build --wait dashboard
+        ;;
+    demo|demo-stop)
+        export CATALOG_WEB_PORT=8775 CATALOG_DB_PORT=55433
+        if [ "$1" = demo-stop ]; then
+            exec docker compose -p satauto-catalog-demo stop dashboard postgres
+        fi
+        docker compose -p satauto-catalog-demo up -d --build --wait dashboard >&2
+        docker compose -p satauto-catalog-demo run --rm --no-deps -T dashboard python -m catalog.demo
+        printf '%s\n' 'Демонстрационный каталог с синтетическими данными: http://127.0.0.1:8775/'
+        exit 0
+        ;;
+esac
+docker compose up -d --wait dashboard >&2
 if [ "$background" -eq 1 ]; then
     exec docker compose up -d parser
 fi

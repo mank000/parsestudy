@@ -13,21 +13,21 @@ help:
 	  'make parser-run                 загрузить порцию карточек SATAuto' \
 	  'make parser-resume              продолжить очередь SATAuto' \
 	  'make parser-status              посмотреть очередь и причины ошибок' \
-	  'make parser-all                 запустить полный обход SATAuto в фоне' \
+	  'make parser-all                 запустить сбор API SATAuto в фоне' \
 	  'make parser-logs                посмотреть журнал полного обхода' \
 	  'make parser-stop                остановить полный обход' \
 	  'make sitemap                    обновить полный индекс адресов' \
 	  'make carhub                     собрать публичную выборку CarHub' \
 	  'make trim-build RUN=8           построить справочник из прогона' \
 	  'make trim-check RUN=4           проверить совпадения в прогоне' \
-	  'make test                       выполнить интеграционные тесты' \
+	  'make test                       выполнить автоматические тесты с PostgreSQL' \
 	  'make down                       остановить каталог'
 
 up:
 	./parse init
 
 down:
-	docker compose --profile full-scan stop
+	docker compose --profile full-scan --profile api stop
 
 parser-run parser-resume:
 	./parse --details "$(DETAILS)" $(if $(BRAND),--make "$(BRAND)")
@@ -55,4 +55,4 @@ trim-build trim-check:
 
 test:
 	docker compose up -d --wait postgres
-	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" "$(PYTHON)" -m unittest discover -s tests -v
+	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" "$(PYTHON)" tests/run.py
