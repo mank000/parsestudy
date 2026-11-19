@@ -29,6 +29,24 @@ services:
       - ./catalog:/app/catalog:ro
       - ./reports:/app/reports:ro
     restart: unless-stopped
+  api:
+    profiles: [api]
+    image: satauto-catalog-study-dashboard
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *catalog-database
+    env_file:
+      - path: .api.env
+        required: false
+    ports:
+      - "127.0.0.1:8766:8766"
+    volumes:
+      - ./catalog:/app/catalog:ro
+    command: ["uvicorn", "catalog.api:app", "--host", "0.0.0.0", "--port", "8766"]
+    restart: unless-stopped
   parser:
     profiles: [full-scan]
     image: satauto-catalog-study-dashboard
