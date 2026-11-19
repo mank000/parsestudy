@@ -6,13 +6,20 @@ background=0
 case "${1:-}" in
     -h|--help)
         cat <<'USAGE'
-./parse                        загрузить до 96 новых карточек SATAuto
+./parse                        начать или продолжить сбор по API SATAuto
+./parse api --pages 3           проверить три страницы API
+./parse api --country JP        собрать выдачу по Японии
+./parse api --country CN --year 2020  собрать машины 2020 года из Китая
+./parse all --country KR --year-min 2020 --year-max 2023  собрать выборку в фоне
+./parse all --workers 6         шесть цепочек по странам и диапазонам лет
+./parse api --country JP --restart  начать выдачу Японии с первой страницы
 ./parse --details 24           ограничить запуск 24 подробными карточками
 ./parse --make toyota          выбрать марку из загруженного индекса
 ./parse index                 обновить полный индекс адресов SATAuto
-./parse list                  сохранить выдачу SATAuto без открытия карточек
+./parse list                   собрать следующую порцию страниц каталога
+./parse list --brand-pages 24  обработать до 24 страниц марок за запуск
 ./parse status                показать очередь SATAuto
-./parse all                   запустить полный обход SATAuto в фоне
+./parse all                   начать или продолжить сбор API в фоне
 ./parse logs                  посмотреть журнал полного обхода
 ./parse stop                  остановить полный обход
 ./parse carhub                собрать три страницы публичного CarHub
@@ -23,6 +30,12 @@ USAGE
     index)
         shift
         set -- sitemap --all --store "$@"
+        ;;
+    ""|api)
+        if [ "$#" -gt 0 ]; then
+            shift
+        fi
+        set -- satauto-api "$@"
         ;;
     list)
         shift
@@ -41,10 +54,51 @@ USAGE
         exec docker compose stop "$@" parser
         ;;
     all)
-        if [ "$#" -ne 1 ]; then
-            printf '%s\n' 'Использование: ./parse all' >&2
+        shift
+        SATAUTO_COUNTRY=
+        SATAUTO_YEAR=
+        SATAUTO_YEAR_MIN=
+        SATAUTO_YEAR_MAX=
+        SATAUTO_WORKERS=6
+        while [ "$#" -gt 0 ]; do
+            if [ "$#" -lt 2 ]; then
+                printf '%s\n' 'Нужно значение после параметра фильтра' >&2
+                exit 2
+            fi
+            case "$1" in
+                --workers)
+                    case "$2" in [1-6]) ;; *) printf '%s\n' 'Число потоков должно быть от 1 до 6' >&2; exit 2 ;; esac
+                    SATAUTO_WORKERS=$2
+                    ;;
+                --country)
+                    case "$2" in CN|KR|JP) ;; *) printf '%s\n' 'Страна должна быть CN, KR или JP' >&2; exit 2 ;; esac
+                    SATAUTO_COUNTRY=$2
+                    ;;
+                --year|--year-min|--year-max)
+                    case "$2" in [12][0-9][0-9][0-9]) ;; *) printf '%s\n' 'Нужен год от 1900 до 2100' >&2; exit 2 ;; esac
+                    if [ "$2" -lt 1900 ] || [ "$2" -gt 2100 ]; then
+                        printf '%s\n' 'Нужен год от 1900 до 2100' >&2
+                        exit 2
+                    fi
+                    case "$1" in
+                        --year) SATAUTO_YEAR=$2 ;;
+                        --year-min) SATAUTO_YEAR_MIN=$2 ;;
+                        --year-max) SATAUTO_YEAR_MAX=$2 ;;
+                    esac
+                    ;;
+                *) printf '%s\n' "Неизвестный параметр фонового сбора: $1" >&2; exit 2 ;;
+            esac
+            shift 2
+        done
+        if [ -n "$SATAUTO_YEAR" ] && { [ -n "$SATAUTO_YEAR_MIN" ] || [ -n "$SATAUTO_YEAR_MAX" ]; }; then
+            printf '%s\n' '--year используется отдельно от --year-min и --year-max' >&2
             exit 2
         fi
+        if [ -n "$SATAUTO_YEAR_MIN" ] && [ -n "$SATAUTO_YEAR_MAX" ] && [ "$SATAUTO_YEAR_MIN" -gt "$SATAUTO_YEAR_MAX" ]; then
+            printf '%s\n' '--year-min должен быть меньше или равен --year-max' >&2
+            exit 2
+        fi
+        export SATAUTO_COUNTRY SATAUTO_YEAR SATAUTO_YEAR_MIN SATAUTO_YEAR_MAX SATAUTO_WORKERS
         background=1
         ;;
     carhub)
@@ -52,6 +106,9 @@ USAGE
         set -- crawl --pages 3 "$@"
         ;;
     init|trim-build|trim-check)
+        ;;
+    --country|--year|--year-min|--year-max|--pages|--restart|--workers)
+        set -- satauto-api "$@"
         ;;
     *)
         set -- public-html --enrich --details 96 "$@"

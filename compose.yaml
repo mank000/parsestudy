@@ -34,12 +34,20 @@ services:
     image: satauto-catalog-study-dashboard
     pull_policy: never
     init: true
+    restart: on-failure
+    stop_grace_period: 35s
     depends_on:
       postgres:
         condition: service_healthy
-    environment: *catalog-database
+    environment:
+      <<: *catalog-database
+      SATAUTO_COUNTRY: ${SATAUTO_COUNTRY:-}
+      SATAUTO_YEAR: ${SATAUTO_YEAR:-}
+      SATAUTO_YEAR_MIN: ${SATAUTO_YEAR_MIN:-}
+      SATAUTO_YEAR_MAX: ${SATAUTO_YEAR_MAX:-}
+      SATAUTO_WORKERS: ${SATAUTO_WORKERS:-6}
     volumes:
       - ./catalog:/app/catalog:ro
-    command: ["python", "-u", "-m", "catalog", "public-html", "--enrich", "--all-details", "--details", "96"]
+    command: ["python", "-u", "-m", "catalog.sync"]
 volumes:
   catalog-db:

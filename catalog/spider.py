@@ -64,6 +64,7 @@ def response_retry_at(response):
 
 class CatalogSpider(scrapy.Spider):
     name = "carhub_catalog"
+    api_path = "/api/v2/cars"
     custom_settings = {
         "ROBOTSTXT_OBEY": True,
         "USER_AGENT": "CatalogStudy/1.0",
@@ -98,7 +99,7 @@ class CatalogSpider(scrapy.Spider):
 
     def request(self, suffix, callback, **kwargs):
         return scrapy.Request(
-            self.run["origin"] + "/api/v2/cars" + suffix,
+            self.run["origin"] + self.api_path + suffix,
             callback=callback, errback=self.request_failed, headers=self.headers, **kwargs,
         )
 
@@ -110,14 +111,18 @@ class CatalogSpider(scrapy.Spider):
         if request:
             yield request
 
-    def page_request(self, cursor):
+    def listing_query(self):
         query = {"limit": self.run["page_limit"]}
         if self.run["source_country"]:
             query["source_country"] = self.run["source_country"]
+        return query
+
+    def page_request(self, cursor):
+        query = self.listing_query()
         if cursor:
             query["cursor"] = cursor
         suffix = "?" + urlencode(query)
-        if len(self.run["origin"]) + len("/api/v2/cars") + len(suffix) > self.settings.getint("URLLENGTH_LIMIT"):
+        if len(self.run["origin"]) + len(self.api_path) + len(suffix) > self.settings.getint("URLLENGTH_LIMIT"):
             self.stop("cursor_url_too_long")
         return self.request(suffix, self.parse_page)
 
@@ -147,7 +152,7 @@ class CatalogSpider(scrapy.Spider):
             self.stop("invalid_payload")
         return result
 
-    def parse_page(self, response):
+    def listing_page(self, response, *, allow_empty=False):
         payload = self.payload(response)
         cars = payload.get("data")
         pagination = payload.get("pagination")
@@ -156,26 +161,33 @@ class CatalogSpider(scrapy.Spider):
         more = pagination.get("has_more")
         cursor = pagination.get("next_cursor") if more else None
         if (type(more) is not bool or len(cars) > self.run["page_limit"]
-                or (more and (not cars or not isinstance(cursor, str) or not cursor))):
+                or (more and (not isinstance(cursor, str) or not cursor or (not cars and not allow_empty)))):
             self.stop("invalid_pagination")
+        return cars, cursor
+
+    def remember_cursor(self, value):
+        added = self.db.execute(
+            "INSERT INTO crawl_cursor VALUES (%s,%s) ON CONFLICT DO NOTHING",
+            (self.run["id"], value),
+        ).rowcount
+        if not added:
+            self.stop("repeated_cursor")
+
+    def parse_page(self, response):
+        cars, cursor = self.listing_page(response)
         try:
             with self.db.transaction():
-                if more:
-                    added = self.db.execute(
-                        "INSERT INTO crawl_cursor VALUES (%s,%s) ON CONFLICT DO NOTHING",
-                        (self.run["id"], cursor),
-                    ).rowcount
-                    if not added:
-                        self.stop("repeated_cursor")
+                if cursor:
+                    self.remember_cursor(cursor)
                 insert_vehicles(self.db, self.run["id"], cars)
                 self.db.execute(
                     """UPDATE crawl_run SET pages=pages+1, cursor=%s, listing_done=%s
-                       WHERE id=%s""", (cursor, not more, self.run["id"]),
+                       WHERE id=%s""", (cursor, cursor is None, self.run["id"]),
                 )
         except (ValueError, TypeError, AttributeError):
             self.stop("invalid_vehicle")
         self.pages_this_session += 1
-        if not more:
+        if cursor is None:
             request = self.next_detail()
             if request:
                 yield request

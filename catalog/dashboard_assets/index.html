@@ -3,22 +3,20 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Аналитика автомобильного каталога</title>
+  <title>Аналитика SATAuto</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <header class="top">
     <div class="frame top-inner">
-      <a class="brand" href="/">Автомобильный каталог</a>
-      <nav aria-label="Разделы">
-        <a href="/">Автомобили</a><a href="#overview">Охват</a><a href="#prices">Цены</a><a href="#runs">Прогоны</a>
-      </nav>
+      <a class="brand" href="/">Каталог SATAuto</a>
+      <nav aria-label="Разделы"><a href="/">Автомобили</a><a href="/analytics" aria-current="page">Аналитика</a></nav>
     </div>
   </header>
   <main class="frame">
-    <section id="overview">{overview}</section>
+    <h1>Аналитика SATAuto</h1>
+    <section id="requests" class="panel section"><h2>Запросы к SATAuto</h2>{requests}</section>
     <section id="prices" class="panel section"><h2>Цены и предложения</h2>{prices}</section>
-    <section id="runs" class="panel section"><h2>История прогонов</h2>{history}</section>
   </main>
 </body>
 </html>

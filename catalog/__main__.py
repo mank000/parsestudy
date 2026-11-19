@@ -13,7 +13,8 @@ from scrapy.crawler import CrawlerProcess
 
 from .detail_queue import queue_status
 from .report import render_report
-from .satauto import BASE, run_public_html
+from .satauto import BASE, DEFAULT_BRAND_PAGES, run_public_html
+from .satauto_api import COUNTRIES as SATAUTO_COUNTRIES, filtered_scan_state, partition_state, run_satauto_api, scan_state
 from .sitemap import run_sitemap
 from .spider import PUBLIC_ORIGIN, CatalogSpider, session_metrics
 from .store import import_export, initialize
@@ -48,9 +49,28 @@ def arguments():
     public.add_argument("--enrich", action="store_true", help="Загрузить недостающие карточки из sitemap")
     public.add_argument("--all-details", action="store_true", help="Обойти сохранённый индекс целиком")
     public.add_argument("--list-only", action="store_true", help="Сохранить публичную выдачу без запросов карточек")
+    public.add_argument("--brand-pages", type=int,
+                        help=f"Страниц марок за запуск --list-only (по умолчанию {DEFAULT_BRAND_PAGES})")
     public.add_argument("--make", help="Марка в sitemap, например bmw или mercedes-benz")
     public.add_argument("--details", type=int, choices=range(0, 97), metavar="0–96", default=24)
     public.add_argument("--output", type=Path)
+    satauto_api = commands.add_parser("satauto-api", help="Собирать выдачу SATAuto через API")
+    satauto_api.add_argument("--country", choices=SATAUTO_COUNTRIES, default=os.getenv("SATAUTO_COUNTRY") or None)
+    satauto_api.add_argument("--year", type=int, default=os.getenv("SATAUTO_YEAR") or None,
+                             help="Точный год выпуска")
+    satauto_api.add_argument("--year-min", type=int, default=os.getenv("SATAUTO_YEAR_MIN") or None)
+    satauto_api.add_argument("--year-max", type=int, default=os.getenv("SATAUTO_YEAR_MAX") or None)
+    satauto_api.add_argument("--pages", type=int, help="Остановиться после указанного числа страниц")
+    satauto_api.add_argument("--available-only", action=argparse.BooleanOptionalAction, default=False,
+                             help="Собирать только автомобили в наличии")
+    satauto_api.add_argument("--workers", type=int, choices=range(1, 7),
+                             default=os.getenv("SATAUTO_WORKERS") or 3,
+                             help="Параллельных запросов 1–6. Значения 4–6 включают разделение по годам")
+    satauto_api.add_argument("--restart", action="store_true", help="Начать пагинацию заново с сохранением объявлений")
+    satauto_api.add_argument("--output", type=Path)
+    satauto_api.add_argument("--schema-ready", action="store_true", help=argparse.SUPPRESS)
+    satauto_api.add_argument("--lane", choices=["archive", "recent"], default="archive",
+                             help="recent: отдельная позиция для проверки первых страниц")
     queue = commands.add_parser("queue", help="Состояние очереди карточек SATAuto")
     queue.add_argument("--run", type=int)
     trim_import = commands.add_parser("trim-import", help="Загрузить справочник комплектаций")
@@ -66,6 +86,10 @@ def arguments():
         parser.error("--make используется с --enrich")
     if args.action == "public-html" and args.list_only and (args.enrich or args.all_details):
         parser.error("--list-only используется без --enrich и --all-details")
+    if args.action == "public-html" and args.brand_pages is not None and (
+        not args.list_only or args.root_only or args.brand_pages < 0
+    ):
+        parser.error("--brand-pages требует --list-only без --root-only и число от 0")
     if args.action == "public-html" and args.all_details and (
         not args.enrich or args.root_only or args.make or not args.details
     ):
@@ -74,6 +98,20 @@ def arguments():
         parser.error("--store требует --all для записи полной карты")
     if args.action == "sitemap" and args.shards < 1:
         parser.error("Число файлов должно быть больше нуля")
+    if args.action == "satauto-api" and args.pages is not None and args.pages < 1:
+        parser.error("Число страниц должно быть больше нуля")
+    if args.action == "satauto-api":
+        if not 1 <= args.workers <= 6:
+            parser.error("Число параллельных запросов должно быть от 1 до 6")
+        if args.country is not None and args.country not in SATAUTO_COUNTRIES:
+            parser.error("Страна должна быть CN, KR или JP")
+        years = [args.year, args.year_min, args.year_max]
+        if any(year is not None and not 1900 <= year <= 2100 for year in years):
+            parser.error("Год должен быть от 1900 до 2100")
+        if args.year is not None and (args.year_min is not None or args.year_max is not None):
+            parser.error("--year используется отдельно от --year-min и --year-max")
+        if args.year_min is not None and args.year_max is not None and args.year_min > args.year_max:
+            parser.error("--year-min должен быть меньше или равен --year-max")
     if args.action == "crawl":
         if not 1 <= args.limit <= 100 or args.pages is not None and args.pages < 1:
             parser.error("Размер страницы 1–100, число страниц больше нуля")
@@ -184,19 +222,34 @@ def main():
     dsn = os.getenv("DATABASE_URL", "postgresql://catalog:catalog-local@127.0.0.1:55432/catalog")
     try:
         with psycopg.connect(dsn, autocommit=True) as db:
-            initialize(db)
+            if not getattr(args, "schema_ready", False):
+                initialize(db)
             if args.action == "sitemap":
                 with db.transaction():
                     return run_sitemap(args.output, None, db=db)
             if args.action == "public-html":
+                brand_pages = args.brand_pages if args.brand_pages is not None else DEFAULT_BRAND_PAGES
                 return run_public_html(db, args.details, args.root_only, args.enrich, args.make,
-                                       args.output, full_scan=args.all_details, list_only=args.list_only)
+                                       args.output, full_scan=args.all_details, list_only=args.list_only,
+                                       brand_pages=brand_pages)
             if args.action == "crawl":
                 return run_crawl(db, args)
+            if args.action == "satauto-api":
+                filters = {"year_min": args.year_min, "year_max": args.year_max}
+                if args.year is not None:
+                    filters = {"year_min": args.year, "year_max": args.year}
+                filters = {key: value for key, value in filters.items() if value is not None}
+                if args.available_only:
+                    filters["available_only"] = "true"
+                return run_satauto_api(db, args.country, args.pages, args.restart, args.output, filters, args.workers, args.lane)
             if args.action == "import-export":
                 print(import_export(db, args.path))
             if args.action == "queue":
-                print(json.dumps(queue_status(db, BASE, args.run), ensure_ascii=False, indent=2, default=str))
+                status = queue_status(db, BASE, args.run)
+                status["api"] = scan_state(db, status["run_id"])
+                status["api_selections"] = filtered_scan_state(db, status["run_id"])
+                status["api_partitions"] = partition_state(db, status["run_id"])
+                print(json.dumps(status, ensure_ascii=False, indent=2, default=str))
             if args.action == "trim-import":
                 print(import_trims(db, args.path))
             if args.action in {"trim-build", "trim-check"}:

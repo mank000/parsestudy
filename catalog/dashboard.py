@@ -1,171 +1,135 @@
-"""Local, read-only dashboard for stored catalog runs."""
+"""Local, read-only dashboard for SATAuto listings and collection metrics."""
 import argparse
-import json
 import os
 import re
-from datetime import datetime
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from zoneinfo import ZoneInfo
 from urllib.parse import parse_qs, urlsplit
 
 import psycopg
-from psycopg.rows import dict_row, tuple_row
+from psycopg.rows import dict_row
 
-from .inventory import car_html, inventory_html
-from .report import render_report
+from .inventory import COUNTRIES, amount, car_html, car_source, current_satauto_catalog, inventory_html
 
 
 ASSETS = Path(__file__).with_name("dashboard_assets")
-REPORTS = Path(__file__).resolve().parents[1] / "reports"
 DEFAULT_DSN = "postgresql://catalog:catalog-local@127.0.0.1:55432/catalog"
-COUNTRIES = {"china": "Китай", "korea": "Южная Корея", "japan": "Япония"}
-STATUS = {"complete": "Завершён", "partial": "Частичный", "failed": "Ошибка", "running": "Идёт"}
-CELL = re.compile(r"(?<!\\)\|")
 
 
 def number(value, decimals=0):
     return f"{value:,.{decimals}f}".replace(",", " ").replace(".", ",")
 
 
-def read_metrics(name):
-    return json.loads((REPORTS / name).read_text(encoding="utf-8"))
-
-
-def update_date():
-    title = (REPORTS / "RESULTS.md").read_text(encoding="utf-8")
-    return next((line.removeprefix("Замеры выполнены ").split(".")[0]
-                 for line in title.splitlines() if line.startswith("Замеры выполнены ")), "")
-
-
-def overview():
-    latest = REPORTS / "catalog-sitemap.json"
-    audit = read_metrics("catalog-sitemap.json" if latest.is_file() else "live-satauto-sitemap.json")
-    if latest.is_file() and audit.get("complete"):
-        captured = datetime.fromtimestamp(latest.stat().st_mtime, ZoneInfo("Asia/Barnaul")).strftime("%d.%m.%Y")
-    else:
-        audit = read_metrics("live-satauto-sitemap.json")
-        captured = update_date()
-    probe = read_metrics("live-carhub-demo.json" if (REPORTS / "live-carhub-demo.json").is_file()
-                         else "live-carhub-2026-11-17.json")
-    benchmark = read_metrics("benchmark.json")
-    scope = "Полная карта сайта" if audit["complete"] else "Часть карты сайта"
-    stats = [
-        ("Карточек в карте сайта", number(audit["unique_ids"]), scope),
-        ("Время обхода", f'{number(audit["seconds"], 1)} с', "Scrapy · живой замер"),
-        ("HTTP-запросов", number(audit["attempts"]), f'{audit["shards_downloaded"]} XML-файлов, индекс и robots.txt'),
+def http_statistics(db):
+    if not db.execute("SELECT to_regclass('satauto_http_daily')").fetchone()["to_regclass"]:
+        return '<p class="hint">Счётчики HTTP пока недоступны.</p>'
+    totals = db.execute("""
+        SELECT min(day) AS first, max(day) AS last, sum(attempts) AS attempts,
+               sum(responses) AS responses, sum(ok) AS ok, sum(bad_gateway) AS bad_gateway
+        FROM satauto_http_daily
+        """).fetchone()
+    if not totals["attempts"]:
+        return '<p class="hint">Пока нет сохранённых данных о запросах к SATAuto.</p>'
+    first = totals["first"].strftime("%d.%m.%Y")
+    last = totals["last"].strftime("%d.%m.%Y")
+    dates = first if first == last else f"{first} — {last}"
+    attempts = totals["attempts"]
+    metrics = [
+        ("HTTP-запросов", attempts, "Все учтённые попытки, включая повторные запросы"),
+        ("HTTP 200 · Успешные ответы", totals["ok"], f'{number(100 * totals["ok"] / attempts, 1)}% запросов'),
+        ("HTTP 502 · Ошибка шлюза", totals["bad_gateway"],
+         f'{number(100 * totals["bad_gateway"] / attempts, 1)}% запросов'),
     ]
-    cards = "".join(f'<div class="metric"><span>{label}</span><strong>{value}</strong><small>{note}</small></div>'
-                    for label, value, note in stats)
-    bars = []
-    counts = audit["country_counts"]
-    for rank, (country, count) in enumerate(sorted(counts.items(), key=lambda row: -row[1]), 1):
-        label = escape(COUNTRIES.get(country, country))
-        share = count / audit["unique_ids"] * 100 if audit["unique_ids"] else 0
-        width = count / max(counts.values()) * 100 if max(counts.values()) else 0
-        bars.append(f"""
-          <div class="bar-row">
-            <div class="bar-label"><span>{label}</span><strong>{number(count)}</strong></div>
-            <div class="track"><div class="bar rank-{rank}" style="width:{width:.2f}%"></div></div>
-            <span class="share">{number(share, 2)}%</span>
-          </div>""")
+    cards = "".join(
+        f'<div class="metric"><span>{label}</span><strong>{number(value)}</strong><small>{note}</small></div>'
+        for label, value, note in metrics
+    )
+    other = totals["responses"] - totals["ok"] - totals["bad_gateway"]
+    unanswered = attempts - totals["responses"]
     return f"""
-    <p class="eyebrow">Снимок от {escape(captured)}</p>
-    <h1>Аналитика каталога</h1>
-    <p class="intro">Охват SATAuto по странам, цены и результаты сборщика.</p>
-    <div class="metrics">{cards}</div>
-    <div class="overview-grid">
-      <section class="panel"><h2>Карточки по странам</h2>
-        <p class="hint">Карта сайта учитывает опубликованные страницы. Доступность автомобилей проверяется по объявлениям.</p>
-        <div class="chart">{"".join(bars)}</div>
-      </section>
-      <section class="panel"><h2>Проверка сборщика</h2>
-        <dl class="checks">
-          <div><dt>CarHub · живой прогон</dt><dd>{number(probe["records"])} записей · {number(probe["session_attempts"])} запроса · {number(probe["session_seconds"], 3)} с</dd></div>
-          <div><dt>Локальный тест · синтетические данные</dt><dd>{number(benchmark["records"])} записей за {number(benchmark["session_seconds"], 3)} с</dd></div>
-          <div><dt>Запросов в локальном тесте</dt><dd>{number(benchmark["session_attempts"])}</dd></div>
-        </dl>
-      </section>
-    </div>"""
+      <p class="hint">Период учтённых запросов · {dates} (UTC)</p>
+      <div class="metrics">{cards}</div>
+      <dl class="http-details">
+        <div><dt>Ответы с другими кодами</dt><dd>{number(other)}</dd></div>
+        <div><dt>Запросы без HTTP-ответа</dt><dd>{number(unanswered)}</dd></div>
+      </dl>
+    """
 
 
-def report_html(markdown):
-    """Render the headings, paragraphs and tables emitted by render_report."""
-    output = []
-    lines = iter(markdown.splitlines())
-    for line in lines:
-        if line.startswith("# "):
-            continue
-        if line.startswith("## "):
-            output.append(f"<h3>{escape(line[3:])}</h3>")
-        elif line.startswith("|"):
-            output.append('<div class="table-wrap"><table>')
-            row = line
-            header = True
-            while row.startswith("|"):
-                cells = [cell.strip().replace(r"\|", "|") for cell in CELL.split(row)[1:-1]]
-                if header:
-                    output.append("<thead><tr>" + "".join(
-                        f'<th scope="col">{escape(cell)}</th>' for cell in cells
-                    ) + "</tr></thead><tbody>")
-                    next(lines, "")  # Markdown header separator
-                    header = False
-                else:
-                    output.append("<tr>" + "".join(f"<td>{escape(cell)}</td>" for cell in cells) + "</tr>")
-                row = next(lines, "")
-            output.append("</tbody></table></div>")
-        elif line:
-            output.append(f"<p>{escape(line.removeprefix('**').removesuffix('**'))}</p>")
-    return "".join(output)
+def market_statistics(db, run_id):
+    countries = db.execute("""
+        SELECT country, grouping(country) AS overall, count(*) AS listings,
+               count(*) FILTER (WHERE availability='active') AS active,
+               count(*) FILTER (WHERE availability='sold') AS sold,
+               count(*) FILTER (WHERE availability IN ('inactive', 'possibly_sold')) AS inactive,
+               count(*) FILTER (
+                   WHERE coalesce(availability, 'unknown') NOT IN ('active', 'sold', 'inactive', 'possibly_sold')
+               ) AS unknown,
+               count(seller_price) FILTER (WHERE availability='active' AND seller_price>0) AS seller_count,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY seller_price)
+                   FILTER (WHERE availability='active' AND seller_price>0) AS seller_median,
+               count(full_price) FILTER (WHERE availability='active' AND full_price>0) AS full_count,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY full_price)
+                   FILTER (WHERE availability='active' AND full_price>0) AS full_median,
+               count(*) FILTER (WHERE has_detail) AS detailed, count(photo) AS photos, count(mileage) AS odometer
+        FROM vehicle_inventory WHERE run_id=%s
+        GROUP BY GROUPING SETS ((), (country))
+        ORDER BY overall, listings DESC, country
+        """, (run_id,)).fetchall()
+    if not countries[-1]["listings"]:
+        return '<p class="hint">Сохранённых объявлений пока нет.</p>'
+    headings = (
+        "Страна", "Объявления", "В продаже", "Продано", "Снято или уточняется", "Статус неизвестен",
+        "С ценой продавца", "Медиана цены продавца, ₽", "С полным расчётом", "Медиана полного расчёта, ₽",
+    )
+    coverage_headings = ("Страна", "С подробной карточкой", "С главным фото", "С пробегом")
+    offers = ("listings", "active", "sold", "inactive", "unknown", "seller_count", "seller_median",
+              "full_count", "full_median")
+    offer_rows, coverage_rows = [], []
+    for row in countries:
+        country = "Всего" if row["overall"] else COUNTRIES.get(row["country"], row["country"] or "Не указана")
+        offer_rows.append([country, *(amount(row[key]) for key in offers)])
+        coverage_rows.append([country, *(amount(row[key]) for key in ("detailed", "photos", "odometer"))])
+    return f"""
+      <h3>Предложения по странам</h3>
+      <p class="hint">Медианы рассчитаны по объявлениям в продаже с положительной ценой для каждого вида расчёта.</p>
+      {statistics_table(headings, offer_rows)}
+      <h3>Полнота карточек</h3>
+      {statistics_table(coverage_headings, coverage_rows)}
+    """
 
 
-def database_sections(dsn, selected):
+def statistics_table(headings, rows):
+    header = "".join(f'<th scope="col">{escape(heading)}</th>' for heading in headings)
+    body = "".join(
+        f'<tr><th scope="row">{escape(label)}</th>' +
+        "".join(f"<td>{escape(cell)}</td>" for cell in values) + "</tr>"
+        for label, *values in rows
+    )
+    return f'<div class="table-wrap"><table><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table></div>'
+
+
+def database_sections(dsn):
+    unavailable = '<p class="hint">Данные временно недоступны.</p>'
     try:
         with psycopg.connect(dsn, connect_timeout=3, row_factory=dict_row) as db:
             db.read_only = True
-            db.execute("SET LOCAL statement_timeout = '15s'")
-            runs = db.execute("""
-                SELECT id, origin, mode, status, attempted_requests, seconds, diagnostic,
-                       EXISTS (SELECT 1 FROM vehicle WHERE run_id=crawl_run.id) AS has_vehicles
-                FROM crawl_run ORDER BY id DESC LIMIT 20
-                """).fetchall()
-            if selected is None:
-                current = db.execute("""
-                    SELECT crawl_run.* FROM crawl_run
-                    WHERE status IN ('complete', 'partial')
-                      AND EXISTS (SELECT 1 FROM vehicle WHERE run_id=crawl_run.id)
-                    ORDER BY (status='complete') DESC, id DESC LIMIT 1
-                    """).fetchone()
-            else:
-                current = db.execute("SELECT * FROM crawl_run WHERE id=%s", (selected,)).fetchone()
-            # render_report uses tuple rows for its reusable reporting queries.
-            db.row_factory = tuple_row
-            report = report_html(render_report(db, current)) if current else ""
-    except psycopg.errors.UndefinedTable:
-        return '<p class="hint">В PostgreSQL пока нет прогонов. Выполните импорт или запустите сбор.</p>', ""
+            db.execute("SET LOCAL statement_timeout = '20s'")
+            requests = http_statistics(db)
+            try:
+                current = current_satauto_catalog(db)
+                prices = (market_statistics(db, current["id"]) if current
+                          else '<p class="hint">Сохранённых объявлений пока нет.</p>')
+            except psycopg.errors.UndefinedTable:
+                db.rollback()
+                return requests, '<p class="hint">Сохранённых объявлений пока нет.</p>'
+            except psycopg.Error:
+                db.rollback()
+                return requests, unavailable
     except psycopg.Error:
-        return '<p class="hint">PostgreSQL временно недоступен. Снимок карты сайта остаётся доступен.</p>', ""
-    if not report:
-        message = "Такой прогон отсутствует." if selected is not None else "В PostgreSQL пока нет объявлений с ценами. Здесь появятся медианы и сравнение моделей после успешного сбора или импорта."
-        report = f'<p class="hint">{message}</p>'
-    rows = []
-    for run in runs:
-        run_id = run["id"]
-        origin = "Импорт файла" if run["mode"] == "import" else run["origin"]
-        detail = f' · {escape(run["diagnostic"])}' if run["diagnostic"] else ""
-        data = "Есть" if run["has_vehicles"] else "Нет"
-        rows.append(f"""<tr><td><a href="/analytics?run={run_id}#prices">#{run_id}</a></td>
-          <td>{escape(origin)}</td><td>{escape(STATUS.get(run["status"], run["status"]))}{detail}</td>
-          <td>{data}</td><td>{number(run["attempted_requests"])}</td><td>{number(run["seconds"], 3)} с</td></tr>""")
-    if current:
-        report = f'<p class="selection">Прогон #{current["id"]} · <a href="/analytics#prices">Последний с данными</a></p>' + report
-    history = (
-        '<div class="table-wrap"><table><thead><tr>'
-        '<th>Прогон</th><th>Источник</th><th>Статус</th><th>Объявления</th><th>HTTP</th><th>Время</th>'
-        '</tr></thead><tbody>' + "".join(rows) + '</tbody></table></div>'
-    ) if rows else '<p class="hint">История прогонов пуста.</p>'
-    return report, history
+        return unavailable, unavailable
+    return requests, prices
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -183,25 +147,40 @@ class DashboardHandler(BaseHTTPRequestHandler):
         url = urlsplit(self.path)
         if url.path == "/style.css":
             return self.send_content(200, "text/css", (ASSETS / "style.css").read_text(encoding="utf-8"))
+        if url.path == "/filters.js":
+            return self.send_content(200, "text/javascript", (ASSETS / "filters.js").read_text(encoding="utf-8"))
         params = parse_qs(url.query, keep_blank_values=True)
-        if url.path == "/car" or (url.path == "/" and "run" not in params):
-            if url.path == "/car":
+        if url.path in ("/inventory/options", "/inventory/summary"):
+            status, content = inventory_html(self.server.dsn, params, section=url.path.rsplit("/", 1)[1])
+            return self.send_content(status, "text/html", content)
+        if url.path in ("/car", "/car/source") or url.path == "/":
+            if url.path in ("/car", "/car/source"):
                 run, car = (parse_id(params.get(key, [""])[0]) for key in ("run", "id"))
                 if run is None or car is None:
-                    return self.send_content(400, "text/plain", "Некорректный ID карточки или прогона")
-                status, content = car_html(self.server.dsn, run, car)
+                    return self.send_content(400, "text/plain", "Некорректная ссылка на карточку")
+                if url.path == "/car/source":
+                    status, target = car_source(self.server.dsn, run, car)
+                    if target:
+                        self.send_response(status)
+                        self.send_header("Location", target)
+                        self.send_header("Cache-Control", "no-store")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    message = ("SATAuto временно недоступен. Попробуйте позже." if status == 503
+                               else "Карточка этого лота сейчас отсутствует на SATAuto.")
+                    content = f'<p>{message}</p><p><a href="/car?run={run}&amp;id={car}">Вернуться в карточку</a></p>'
+                else:
+                    status, content = car_html(self.server.dsn, run, car)
             else:
                 status, content = inventory_html(self.server.dsn, params)
             template = (ASSETS / "inventory.html").read_text(encoding="utf-8")
             return self.send_content(status, "text/html", template.format(content=content))
-        if url.path not in ("/", "/analytics"):
+        if url.path != "/analytics":
             return self.send_content(404, "text/plain", "Страница не найдена")
-        selected = params.get("run", [None])[0]
-        if selected is not None and parse_id(selected) is None:
-            return self.send_content(400, "text/plain", "Некорректный номер прогона")
-        prices, history = database_sections(self.server.dsn, int(selected) if selected else None)
+        requests, prices = database_sections(self.server.dsn)
         html = (ASSETS / "index.html").read_text(encoding="utf-8")
-        html = html.format(overview=overview(), prices=prices, history=history)
+        html = html.format(requests=requests, prices=prices)
         return self.send_content(200, "text/html", html)
 
 
