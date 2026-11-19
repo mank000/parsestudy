@@ -26,7 +26,7 @@ if not p.exists():
     p.write_text('CATALOG_JWT_SECRET=' + secrets.token_urlsafe(48) + '\n')
 PY
 docker compose run --rm --no-deps api python -m catalog.api create-user admin
-docker compose --profile api up -d api
+docker compose --profile api up -d --wait api
 ```
 
 Пароль вводится скрыто, минимум 12 символов; хранится только scrypt-хеш с солью.
