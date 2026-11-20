@@ -1,0 +1,142 @@
+#!/bin/sh
+set -eu
+
+cd "$(dirname "$0")"
+background=0
+case "${1:-}" in
+    -h|--help)
+        cat <<'USAGE'
+./parse                        начать или продолжить сбор по API SATAuto
+./parse api --pages 3           проверить три страницы API
+./parse api --country JP        собрать выдачу по Японии
+./parse api --country CN --year 2020  собрать машины 2020 года из Китая
+./parse all --country KR --year-min 2020 --year-max 2023  собрать выборку в фоне
+./parse all --workers 6         шесть цепочек по странам и диапазонам лет
+./parse api --country JP --restart  начать выдачу Японии с первой страницы
+./parse --details 24           ограничить запуск 24 подробными карточками
+./parse --make toyota          выбрать марку из загруженного индекса
+./parse index                 обновить полный индекс адресов SATAuto
+./parse list                   собрать следующую порцию страниц каталога
+./parse list --brand-pages 24  обработать до 24 страниц марок за запуск
+./parse status                показать очередь SATAuto
+./parse all                   начать или продолжить сбор API в фоне
+./parse logs                  посмотреть журнал полного обхода
+./parse stop                  остановить полный обход
+./parse carhub                собрать три страницы публичного CarHub
+./parse init                  запустить каталог и подготовить БД
+./parse demo                  открыть каталог с синтетическими данными на порту 8775
+./parse demo-stop             остановить демонстрационный каталог
+USAGE
+        exit 0
+        ;;
+    index)
+        shift
+        set -- sitemap --all --store "$@"
+        ;;
+    ""|api)
+        if [ "$#" -gt 0 ]; then
+            shift
+        fi
+        set -- satauto-api "$@"
+        ;;
+    list)
+        shift
+        set -- public-html --list-only "$@"
+        ;;
+    status)
+        shift
+        set -- queue "$@"
+        ;;
+    logs)
+        shift
+        exec docker compose logs --tail=30 "$@" parser
+        ;;
+    stop)
+        shift
+        exec docker compose stop "$@" parser
+        ;;
+    all)
+        shift
+        SATAUTO_COUNTRY=
+        SATAUTO_YEAR=
+        SATAUTO_YEAR_MIN=
+        SATAUTO_YEAR_MAX=
+        SATAUTO_WORKERS=6
+        while [ "$#" -gt 0 ]; do
+            if [ "$#" -lt 2 ]; then
+                printf '%s\n' 'Нужно значение после параметра фильтра' >&2
+                exit 2
+            fi
+            case "$1" in
+                --workers)
+                    case "$2" in [1-6]) ;; *) printf '%s\n' 'Число потоков должно быть от 1 до 6' >&2; exit 2 ;; esac
+                    SATAUTO_WORKERS=$2
+                    ;;
+                --country)
+                    case "$2" in CN|KR|JP) ;; *) printf '%s\n' 'Страна должна быть CN, KR или JP' >&2; exit 2 ;; esac
+                    SATAUTO_COUNTRY=$2
+                    ;;
+                --year|--year-min|--year-max)
+                    case "$2" in [12][0-9][0-9][0-9]) ;; *) printf '%s\n' 'Нужен год от 1900 до 2100' >&2; exit 2 ;; esac
+                    if [ "$2" -lt 1900 ] || [ "$2" -gt 2100 ]; then
+                        printf '%s\n' 'Нужен год от 1900 до 2100' >&2
+                        exit 2
+                    fi
+                    case "$1" in
+                        --year) SATAUTO_YEAR=$2 ;;
+                        --year-min) SATAUTO_YEAR_MIN=$2 ;;
+                        --year-max) SATAUTO_YEAR_MAX=$2 ;;
+                    esac
+                    ;;
+                *) printf '%s\n' "Неизвестный параметр фонового сбора: $1" >&2; exit 2 ;;
+            esac
+            shift 2
+        done
+        if [ -n "$SATAUTO_YEAR" ] && { [ -n "$SATAUTO_YEAR_MIN" ] || [ -n "$SATAUTO_YEAR_MAX" ]; }; then
+            printf '%s\n' '--year используется отдельно от --year-min и --year-max' >&2
+            exit 2
+        fi
+        if [ -n "$SATAUTO_YEAR_MIN" ] && [ -n "$SATAUTO_YEAR_MAX" ] && [ "$SATAUTO_YEAR_MIN" -gt "$SATAUTO_YEAR_MAX" ]; then
+            printf '%s\n' '--year-min должен быть меньше или равен --year-max' >&2
+            exit 2
+        fi
+        export SATAUTO_COUNTRY SATAUTO_YEAR SATAUTO_YEAR_MIN SATAUTO_YEAR_MAX SATAUTO_WORKERS
+        background=1
+        ;;
+    carhub)
+        shift
+        set -- crawl --pages 3 "$@"
+        ;;
+    init|demo|demo-stop|trim-build|trim-check)
+        ;;
+    --country|--year|--year-min|--year-max|--pages|--restart|--workers)
+        set -- satauto-api "$@"
+        ;;
+    *)
+        set -- public-html --enrich --details 96 "$@"
+        ;;
+esac
+
+if ! docker info >/dev/null 2>&1 && [ "$(uname -s)" = Darwin ]; then
+    docker desktop start >&2
+fi
+case "${1:-}" in
+    init)
+        exec docker compose up -d --build --wait dashboard
+        ;;
+    demo|demo-stop)
+        export CATALOG_WEB_PORT=8775 CATALOG_DB_PORT=55433
+        if [ "$1" = demo-stop ]; then
+            exec docker compose -p satauto-catalog-demo stop dashboard postgres
+        fi
+        docker compose -p satauto-catalog-demo up -d --build --wait dashboard >&2
+        docker compose -p satauto-catalog-demo run --rm --no-deps -T dashboard python -m catalog.demo
+        printf '%s\n' 'Демонстрационный каталог с синтетическими данными: http://127.0.0.1:8775/'
+        exit 0
+        ;;
+esac
+docker compose up -d --wait dashboard >&2
+if [ "$background" -eq 1 ]; then
+    exec docker compose up -d parser
+fi
+exec docker compose run --rm --no-deps -T dashboard python -m catalog "$@"

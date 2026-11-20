@@ -11,11 +11,17 @@ import psycopg
 from psycopg.rows import dict_row
 from scrapy.crawler import CrawlerProcess
 
+from .detail_queue import queue_status
 from .report import render_report
-from .satauto import run_public_html
+from .satauto import BASE, DEFAULT_BRAND_PAGES, run_public_html
+from .satauto_api import COUNTRIES as SATAUTO_COUNTRIES, filtered_scan_state, partition_state, run_satauto_api, scan_state
 from .sitemap import run_sitemap
-from .spider import PUBLIC_ORIGIN, CatalogSpider
+from .spider import PUBLIC_ORIGIN, CatalogSpider, session_metrics
 from .store import import_export, initialize
+from .trims import audit_trims, build_trims, import_trims
+
+
+PUBLIC_PAGE_BUDGET = 3
 
 
 def arguments():
@@ -41,16 +47,72 @@ def arguments():
     public = commands.add_parser("public-html")
     public.add_argument("--root-only", action="store_true")
     public.add_argument("--enrich", action="store_true", help="Загрузить недостающие карточки из sitemap")
+    public.add_argument("--all-details", action="store_true", help="Обойти сохранённый индекс целиком")
+    public.add_argument("--list-only", action="store_true", help="Сохранить публичную выдачу без запросов карточек")
+    public.add_argument("--brand-pages", type=int,
+                        help=f"Страниц марок за запуск --list-only (по умолчанию {DEFAULT_BRAND_PAGES})")
     public.add_argument("--make", help="Марка в sitemap, например bmw или mercedes-benz")
     public.add_argument("--details", type=int, choices=range(0, 97), metavar="0–96", default=24)
+    public.add_argument("--output", type=Path)
+    satauto_api = commands.add_parser("satauto-api", help="Собирать выдачу SATAuto через API")
+    satauto_api.add_argument("--country", choices=SATAUTO_COUNTRIES, default=os.getenv("SATAUTO_COUNTRY") or None)
+    satauto_api.add_argument("--year", type=int, default=os.getenv("SATAUTO_YEAR") or None,
+                             help="Точный год выпуска")
+    satauto_api.add_argument("--year-min", type=int, default=os.getenv("SATAUTO_YEAR_MIN") or None)
+    satauto_api.add_argument("--year-max", type=int, default=os.getenv("SATAUTO_YEAR_MAX") or None)
+    satauto_api.add_argument("--pages", type=int, help="Остановиться после указанного числа страниц")
+    satauto_api.add_argument("--available-only", action=argparse.BooleanOptionalAction, default=False,
+                             help="Собирать только автомобили в наличии")
+    satauto_api.add_argument("--workers", type=int, choices=range(1, 7),
+                             default=os.getenv("SATAUTO_WORKERS") or 3,
+                             help="Параллельных запросов 1–6. Значения 4–6 включают разделение по годам")
+    satauto_api.add_argument("--restart", action="store_true", help="Начать пагинацию заново с сохранением объявлений")
+    satauto_api.add_argument("--output", type=Path)
+    satauto_api.add_argument("--schema-ready", action="store_true", help=argparse.SUPPRESS)
+    satauto_api.add_argument("--sync-profile", help=argparse.SUPPRESS)
+    satauto_api.add_argument("--lane", choices=["archive", "recent"], default="archive",
+                             help="recent: отдельная позиция для проверки первых страниц")
+    queue = commands.add_parser("queue", help="Состояние очереди карточек SATAuto")
+    queue.add_argument("--run", type=int)
+    trim_import = commands.add_parser("trim-import", help="Загрузить справочник комплектаций")
+    trim_import.add_argument("path", type=Path)
+    for name, help_text in (
+        ("trim-build", "Собрать справочник по совпавшим сохранённым объявлениям"),
+        ("trim-check", "Проверить совпадения со справочником в одном прогоне"),
+    ):
+        commands.add_parser(name, help=help_text).add_argument("--run", type=int, required=True)
     commands.add_parser("init")
     args = parser.parse_args()
     if args.action == "public-html" and args.make and not args.enrich:
         parser.error("--make используется с --enrich")
+    if args.action == "public-html" and args.list_only and (args.enrich or args.all_details):
+        parser.error("--list-only используется без --enrich и --all-details")
+    if args.action == "public-html" and args.brand_pages is not None and (
+        not args.list_only or args.root_only or args.brand_pages < 0
+    ):
+        parser.error("--brand-pages требует --list-only без --root-only и число от 0")
+    if args.action == "public-html" and args.all_details and (
+        not args.enrich or args.root_only or args.make or not args.details
+    ):
+        parser.error("--all-details требует --enrich и ненулевую порцию. Марка и --root-only не используются")
     if args.action == "sitemap" and args.store and not args.all:
         parser.error("--store требует --all для записи полной карты")
     if args.action == "sitemap" and args.shards < 1:
         parser.error("Число файлов должно быть больше нуля")
+    if args.action == "satauto-api" and args.pages is not None and args.pages < 1:
+        parser.error("Число страниц должно быть больше нуля")
+    if args.action == "satauto-api":
+        if not 1 <= args.workers <= 6:
+            parser.error("Число параллельных запросов должно быть от 1 до 6")
+        if args.country is not None and args.country not in SATAUTO_COUNTRIES:
+            parser.error("Страна должна быть CN, KR или JP")
+        years = [args.year, args.year_min, args.year_max]
+        if any(year is not None and not 1900 <= year <= 2100 for year in years):
+            parser.error("Год должен быть от 1900 до 2100")
+        if args.year is not None and (args.year_min is not None or args.year_max is not None):
+            parser.error("--year используется отдельно от --year-min и --year-max")
+        if args.year_min is not None and args.year_max is not None and args.year_min > args.year_max:
+            parser.error("--year-min должен быть меньше или равен --year-max")
     if args.action == "crawl":
         if not 1 <= args.limit <= 100 or args.pages is not None and args.pages < 1:
             parser.error("Размер страницы 1–100, число страниц больше нуля")
@@ -75,7 +137,7 @@ def run_crawl(db, args):
     if (not url.hostname or url.username or url.password or url.path or url.query or url.fragment
             or not (url.scheme == "https" or (url.scheme == "http" and url.hostname == "127.0.0.1"))):
         raise ValueError("Нужен HTTPS-адрес согласованного API или локальный HTTP для теста")
-    if public and (args.full or args.resume or args.pages is not None and args.pages > 3):
+    if public and (args.full or args.pages is not None and args.pages > PUBLIC_PAGE_BUDGET):
         raise ValueError("Публичный режим поддерживает пробу до 3 страниц. Для полной выгрузки используйте согласованный источник или импорт.")
     budget = (args.pages or 1) if public else args.pages
     token = os.getenv("CATALOG_API_TOKEN") if not public else None
@@ -97,6 +159,11 @@ def run_crawl(db, args):
     run = get_run(db, run_id)
     if run["origin"] != origin or run["status"] not in {"running", "partial", "failed"}:
         raise ValueError("Продолжить можно незавершённый прогон на том же источнике")
+    if public and args.resume:
+        remaining = PUBLIC_PAGE_BUDGET - run["pages"]
+        if remaining <= 0 or run["mode"] != "listing":
+            raise ValueError("Лимит публичной пробы исчерпан. Для полной выгрузки используйте согласованный источник или импорт.")
+        budget = min(remaining, args.pages or remaining)
     cooldown = db.execute(
         "SELECT max(retry_at) FROM crawl_run WHERE origin=%s", (origin,),
     ).fetchone()[0]
@@ -138,8 +205,7 @@ def run_crawl(db, args):
     metrics = {
         "run_id": run_id, "status": status, "reason": reason, "records": total,
         "details": details, "detail_missing": missing, "pages": saved["pages"],
-        "session_attempts": attempted, "session_responses": downloaded, "session_bytes": transfer,
-        "session_seconds": round(seconds, 3), "retry_at": stats.get("catalog/retry_at"),
+        **session_metrics(stats, seconds),
     }
     output = json.dumps(metrics, ensure_ascii=False, indent=2, default=str)
     print(output)
@@ -157,17 +223,41 @@ def main():
     dsn = os.getenv("DATABASE_URL", "postgresql://catalog:catalog-local@127.0.0.1:55432/catalog")
     try:
         with psycopg.connect(dsn, autocommit=True) as db:
-            initialize(db)
+            if not getattr(args, "schema_ready", False):
+                initialize(db)
             if args.action == "sitemap":
                 with db.transaction():
                     return run_sitemap(args.output, None, db=db)
             if args.action == "public-html":
-                return run_public_html(db, args.details, args.root_only, args.enrich, args.make)
+                brand_pages = args.brand_pages if args.brand_pages is not None else DEFAULT_BRAND_PAGES
+                return run_public_html(db, args.details, args.root_only, args.enrich, args.make,
+                                       args.output, full_scan=args.all_details, list_only=args.list_only,
+                                       brand_pages=brand_pages)
             if args.action == "crawl":
                 return run_crawl(db, args)
+            if args.action == "satauto-api":
+                filters = {"year_min": args.year_min, "year_max": args.year_max}
+                if args.year is not None:
+                    filters = {"year_min": args.year, "year_max": args.year}
+                filters = {key: value for key, value in filters.items() if value is not None}
+                if args.available_only:
+                    filters["available_only"] = "true"
+                return run_satauto_api(db, args.country, args.pages, args.restart, args.output, filters,
+                                       args.workers, args.lane, sync_profile=args.sync_profile)
             if args.action == "import-export":
-                with db.transaction():
-                    print(import_export(db, args.path))
+                print(import_export(db, args.path))
+            if args.action == "queue":
+                status = queue_status(db, BASE, args.run)
+                status["api"] = scan_state(db, status["run_id"])
+                status["api_selections"] = filtered_scan_state(db, status["run_id"])
+                status["api_partitions"] = partition_state(db, status["run_id"])
+                print(json.dumps(status, ensure_ascii=False, indent=2, default=str))
+            if args.action == "trim-import":
+                print(import_trims(db, args.path))
+            if args.action in {"trim-build", "trim-check"}:
+                get_run(db, args.run)
+                operation = build_trims if args.action == "trim-build" else audit_trims
+                print(json.dumps(operation(db, args.run), ensure_ascii=False, indent=2))
             if args.action == "report":
                 run = get_run(db, args.run)
                 report = render_report(db, run)

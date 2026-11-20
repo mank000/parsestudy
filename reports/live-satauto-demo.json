@@ -1,0 +1,20 @@
+{
+  "run_id": 4,
+  "records": 102,
+  "details": 102,
+  "new_records": 8,
+  "new_details": 8,
+  "reason": "finished",
+  "session_attempts": 9,
+  "session_responses": 9,
+  "session_bytes": 672237,
+  "session_seconds": 11.174,
+  "http_statuses": {
+    "200": 9
+  },
+  "http_errors": 0,
+  "transport_errors": 0,
+  "logged_errors": 0,
+  "retry_at": null,
+  "http_503": null
+}

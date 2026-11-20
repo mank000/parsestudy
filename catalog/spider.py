@@ -1,10 +1,13 @@
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlencode
+from time import monotonic
+from urllib.parse import urlencode, urlsplit
 
 import scrapy
 from psycopg.types.json import Jsonb
+from scrapy.downloadermiddlewares.retry import get_retry_request
 from scrapy.exceptions import CloseSpider, IgnoreRequest
 from scrapy.http import TextResponse
 
@@ -12,6 +15,28 @@ from .store import insert_vehicles
 
 
 PUBLIC_ORIGIN = "https://carhubauto.ru"
+MAX_503_RETRIES = 2
+MAX_INLINE_WAIT = 120
+
+
+def session_metrics(stats, seconds):
+    return {
+        "session_attempts": stats.get("catalog/attempted", 0),
+        "session_responses": stats.get("catalog/downloaded", 0),
+        "session_bytes": stats.get("catalog/bytes", 0),
+        "session_seconds": round(seconds, 3),
+        "http_statuses": {
+            key.rsplit("/", 1)[-1]: count
+            for key, count in stats.items() if key.startswith("catalog/status/")
+        },
+        "http_errors": stats.get("catalog/http_errors", 0),
+        "transport_errors": stats.get("catalog/transport_errors", 0),
+        "logged_errors": stats.get("log_count/ERROR", 0),
+        "retry_at": stats.get("catalog/retry_at"),
+        "http_503": stats.get("catalog/http_503"),
+        "retries_503": stats.get("catalog/retries_503", 0),
+        "recoveries_503": stats.get("catalog/recoveries_503", 0),
+    }
 
 
 def retry_time(header):
@@ -30,8 +55,16 @@ def retry_time(header):
             return None
 
 
+def response_retry_at(response):
+    when = retry_time(response.headers.get("Retry-After"))
+    if when is None and response.status in {429, 503}:
+        when = datetime.now(timezone.utc) + timedelta(seconds=60)
+    return when
+
+
 class CatalogSpider(scrapy.Spider):
     name = "carhub_catalog"
+    api_path = "/api/v2/cars"
     custom_settings = {
         "ROBOTSTXT_OBEY": True,
         "USER_AGENT": "CatalogStudy/1.0",
@@ -66,7 +99,7 @@ class CatalogSpider(scrapy.Spider):
 
     def request(self, suffix, callback, **kwargs):
         return scrapy.Request(
-            self.run["origin"] + "/api/v2/cars" + suffix,
+            self.run["origin"] + self.api_path + suffix,
             callback=callback, errback=self.request_failed, headers=self.headers, **kwargs,
         )
 
@@ -78,14 +111,18 @@ class CatalogSpider(scrapy.Spider):
         if request:
             yield request
 
-    def page_request(self, cursor):
+    def listing_query(self):
         query = {"limit": self.run["page_limit"]}
         if self.run["source_country"]:
             query["source_country"] = self.run["source_country"]
+        return query
+
+    def page_request(self, cursor):
+        query = self.listing_query()
         if cursor:
             query["cursor"] = cursor
         suffix = "?" + urlencode(query)
-        if len(self.run["origin"]) + len("/api/v2/cars") + len(suffix) > self.settings.getint("URLLENGTH_LIMIT"):
+        if len(self.run["origin"]) + len(self.api_path) + len(suffix) > self.settings.getint("URLLENGTH_LIMIT"):
             self.stop("cursor_url_too_long")
         return self.request(suffix, self.parse_page)
 
@@ -103,10 +140,7 @@ class CatalogSpider(scrapy.Spider):
 
     def payload(self, response):
         if response.status != 200:
-            when = retry_time(response.headers.get("Retry-After"))
-            if response.status == 429 and when is None:
-                when = datetime.now(timezone.utc) + timedelta(minutes=1)
-            self.stop(f"http_{response.status}", when)
+            self.stop(f"http_{response.status}", response_retry_at(response))
         content_type = response.headers.get("Content-Type", b"").lower()
         if b"application/json" not in content_type:
             self.stop("unexpected_content_type")
@@ -118,7 +152,7 @@ class CatalogSpider(scrapy.Spider):
             self.stop("invalid_payload")
         return result
 
-    def parse_page(self, response):
+    def listing_page(self, response, *, allow_empty=False):
         payload = self.payload(response)
         cars = payload.get("data")
         pagination = payload.get("pagination")
@@ -127,26 +161,33 @@ class CatalogSpider(scrapy.Spider):
         more = pagination.get("has_more")
         cursor = pagination.get("next_cursor") if more else None
         if (type(more) is not bool or len(cars) > self.run["page_limit"]
-                or (more and (not cars or not isinstance(cursor, str) or not cursor))):
+                or (more and (not isinstance(cursor, str) or not cursor or (not cars and not allow_empty)))):
             self.stop("invalid_pagination")
+        return cars, cursor
+
+    def remember_cursor(self, value):
+        added = self.db.execute(
+            "INSERT INTO crawl_cursor VALUES (%s,%s) ON CONFLICT DO NOTHING",
+            (self.run["id"], value),
+        ).rowcount
+        if not added:
+            self.stop("repeated_cursor")
+
+    def parse_page(self, response):
+        cars, cursor = self.listing_page(response)
         try:
             with self.db.transaction():
-                if more:
-                    added = self.db.execute(
-                        "INSERT INTO crawl_cursor VALUES (%s,%s) ON CONFLICT DO NOTHING",
-                        (self.run["id"], cursor),
-                    ).rowcount
-                    if not added:
-                        self.stop("repeated_cursor")
+                if cursor:
+                    self.remember_cursor(cursor)
                 insert_vehicles(self.db, self.run["id"], cars)
                 self.db.execute(
                     """UPDATE crawl_run SET pages=pages+1, cursor=%s, listing_done=%s
-                       WHERE id=%s""", (cursor, not more, self.run["id"]),
+                       WHERE id=%s""", (cursor, cursor is None, self.run["id"]),
                 )
         except (ValueError, TypeError, AttributeError):
             self.stop("invalid_vehicle")
         self.pages_this_session += 1
-        if not more:
+        if cursor is None:
             request = self.next_detail()
             if request:
                 yield request
@@ -204,16 +245,67 @@ class AccessGuard:
     def downloaded_response(self, response, request, spider=None):
         self.crawler.stats.inc_value("catalog/downloaded")
         self.crawler.stats.inc_value("catalog/bytes", len(response.body))
+        self.crawler.stats.inc_value(f"catalog/status/{response.status}")
+        if response.status >= 400:
+            self.crawler.stats.inc_value("catalog/http_errors")
 
-    def process_response(self, request, response):
-        if request.url.endswith("/robots.txt") and response.status not in {200, 404, 410}:
-            self.crawler.stats.set_value("catalog/diagnostic", f"robots_http_{response.status}")
-            self.crawler.stats.set_value("catalog/retry_at", retry_time(response.headers.get("Retry-After")))
+    async def process_response(self, request, response):
+        stats = self.crawler.stats
+        first_503 = request.meta.get("first_503")
+        if response.status == 503:
+            now = monotonic()
+            first_503 = first_503 if first_503 is not None else now
+            when = response_retry_at(response)
+            wait = max(0, (when - datetime.now(timezone.utc)).total_seconds())
+            diagnostic = self.diagnostic_503(request, response)
+            diagnostic["still_503_after_seconds"] = round(now - first_503, 3)
+            stats.set_value("catalog/http_503", diagnostic)
+            if request.meta.get("retry_times", 0) < MAX_503_RETRIES and wait <= MAX_INLINE_WAIT:
+                spider = self.crawler.spider
+                retry = get_retry_request(request, spider=spider, reason="http_503",
+                                          max_retry_times=MAX_503_RETRIES)
+                retry.meta["first_503"] = first_503
+                spider.logger.warning("HTTP 503 %s; повтор через %.1f с", diagnostic["path"], wait)
+                await asyncio.sleep(wait)
+                stats.inc_value("catalog/retries_503")
+                return retry
+        elif first_503 is not None:
+            diagnostic = stats.get_value("catalog/http_503")
+            diagnostic["next_status"] = response.status
+            if response.status == 200:
+                diagnostic["recovered_after_seconds"] = round(monotonic() - first_503, 3)
+                stats.inc_value("catalog/recoveries_503")
+        if request.meta.get("is_robotstxt_request") and response.status not in {200, 404, 410}:
+            stats.set_value("catalog/diagnostic", f"robots_http_{response.status}")
+            stats.set_value("catalog/retry_at", response_retry_at(response))
             return TextResponse(request.url, body=b"User-agent: *\nDisallow: /\n", encoding="utf-8")
         return response
 
+    @staticmethod
+    def diagnostic_503(request, response):
+        url = urlsplit(request.url)
+        content_type = response.headers.get("Content-Type", b"").decode("ascii", errors="replace")
+        retry_after = response.headers.get("Retry-After")
+        diagnostic = {
+            "path": url.path,
+            "content_type": content_type,
+            "retry_after": retry_after.decode("ascii", errors="replace") if retry_after else None,
+        }
+        if url.netloc in {"carhubauto.ru", "satauto.ru"} and "application/json" in content_type.lower():
+            try:
+                payload = json.loads(response.body)
+            except (ValueError, UnicodeError):
+                payload = {}
+            if isinstance(payload, dict):
+                diagnostic["message"] = {
+                    key: payload[key][:240] for key in ("error", "detail", "message")
+                    if isinstance(payload.get(key), str)
+                }
+        return diagnostic
+
     def process_exception(self, request, exception):
-        if request.url.endswith("/robots.txt"):
+        self.crawler.stats.inc_value("catalog/transport_errors")
+        if request.meta.get("is_robotstxt_request"):
             self.crawler.stats.set_value("catalog/diagnostic", "robots_unavailable")
             return TextResponse(request.url, body=b"User-agent: *\nDisallow: /\n", encoding="utf-8")
         return None

@@ -10,7 +10,7 @@ from defusedxml.ElementTree import fromstring
 from defusedxml.common import DefusedXmlException
 from scrapy.crawler import CrawlerProcess
 
-from .spider import CatalogSpider, retry_time
+from .spider import CatalogSpider, response_retry_at, session_metrics
 
 
 BASE = "https://satauto.ru"
@@ -35,7 +35,7 @@ class SitemapAudit(CatalogSpider):
 
     def xml(self, response, root_tag):
         if response.status != 200:
-            self.stop(f"http_{response.status}", retry_time(response.headers.get("Retry-After")))
+            self.stop(f"http_{response.status}", response_retry_at(response))
         try:
             root = fromstring(response.body)
         except (ParseError, DefusedXmlException):
@@ -96,7 +96,8 @@ class SitemapAudit(CatalogSpider):
 
 def run_sitemap(path, shards, origin=BASE, db=None):
     if db is not None:
-        db.execute("SELECT pg_advisory_xact_lock(274810)")
+        if not db.execute("SELECT pg_try_advisory_xact_lock(274810)").fetchone()[0]:
+            raise ValueError("Индекс занят полным обходом или обновлением SATAuto")
         db.execute("CREATE TEMP TABLE sitemap_stage (LIKE sitemap_car) ON COMMIT DROP")
     output = {
         "index": origin + "/sitemap-cars.xml",
@@ -122,11 +123,16 @@ def run_sitemap(path, shards, origin=BASE, db=None):
     if db is not None and output["complete"]:
         db.execute("DELETE FROM sitemap_car")
         output["stored"] = db.execute("INSERT INTO sitemap_car SELECT * FROM sitemap_stage ON CONFLICT DO NOTHING").rowcount
+        db.execute("DELETE FROM satauto_scan")
     output["attempts"] = stats.get("catalog/attempted", 0)
     output["responses"] = stats.get("catalog/downloaded", 0)
     output["response_body_bytes"] = stats.get("catalog/bytes", 0)
     output["seconds"] = round(perf_counter() - start, 3)
     output["retry_at"] = stats.get("catalog/retry_at")
+    metrics = session_metrics(stats, 0)
+    output.update({key: metrics[key] for key in
+                   ("http_statuses", "http_errors", "transport_errors", "logged_errors",
+                    "http_503", "retries_503", "recoveries_503")})
     payload = json.dumps(output, ensure_ascii=False, indent=2, default=str)
     print(payload)
     if path:

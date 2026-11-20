@@ -1,0 +1,30 @@
+[
+  {
+    "workers": 3,
+    "code": 0,
+    "reason": "page_budget",
+    "session_seconds": 36.241,
+    "session_attempts": 30,
+    "session_items": 1440,
+    "new_records": 1440,
+    "database_seconds": 2.292,
+    "http_statuses": {
+      "200": 30
+    },
+    "parallel_requests": 1
+  },
+  {
+    "workers": 6,
+    "code": 0,
+    "reason": "page_budget",
+    "session_seconds": 14.763,
+    "session_attempts": 30,
+    "session_items": 1440,
+    "new_records": 464,
+    "database_seconds": 1.494,
+    "http_statuses": {
+      "200": 30
+    },
+    "parallel_requests": 3
+  }
+]

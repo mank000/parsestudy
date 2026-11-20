@@ -2,6 +2,4 @@
 !requirements.txt
 !catalog/
 !catalog/**
-!reports/
-!reports/**
 **/__pycache__/

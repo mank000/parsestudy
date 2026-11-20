@@ -1,0 +1,186 @@
+{
+  "run_id": 4,
+  "reason": "http_502",
+  "complete": false,
+  "page_size": 48,
+  "filters": {},
+  "lane": "archive",
+  "records": 739544,
+  "new_records": 0,
+  "session_items": 624,
+  "countries": {
+    "CN": {
+      "pages": 9760,
+      "done": false,
+      "has_cursor": false
+    },
+    "JP": {
+      "pages": 1020,
+      "done": true,
+      "has_cursor": false
+    },
+    "KR": {
+      "pages": 7788,
+      "done": false,
+      "has_cursor": true
+    }
+  },
+  "parallel_requests": 1,
+  "database_seconds": 1.008,
+  "cursor_resets": 0,
+  "partitions": [
+    {
+      "country": "CN",
+      "selection": {},
+      "year_min": null,
+      "year_max": 2015,
+      "pages": 1454,
+      "done": false
+    },
+    {
+      "country": "CN",
+      "selection": {},
+      "year_min": 2016,
+      "year_max": 2019,
+      "pages": 1478,
+      "done": false
+    },
+    {
+      "country": "CN",
+      "selection": {},
+      "year_min": 2020,
+      "year_max": null,
+      "pages": 1489,
+      "done": false
+    },
+    {
+      "country": "CN",
+      "selection": {
+        "available_only": "true"
+      },
+      "year_min": null,
+      "year_max": 2015,
+      "pages": 1573,
+      "done": true
+    },
+    {
+      "country": "CN",
+      "selection": {
+        "available_only": "true"
+      },
+      "year_min": 2016,
+      "year_max": 2019,
+      "pages": 1832,
+      "done": false
+    },
+    {
+      "country": "CN",
+      "selection": {
+        "available_only": "true"
+      },
+      "year_min": 2020,
+      "year_max": null,
+      "pages": 1986,
+      "done": false
+    },
+    {
+      "country": "JP",
+      "selection": {
+        "available_only": "true"
+      },
+      "year_min": null,
+      "year_max": 2015,
+      "pages": 289,
+      "done": true
+    },
+    {
+      "country": "JP",
+      "selection": {
+        "available_only": "true"
+      },
+      "year_min": 2016,
+      "year_max": 2019,
+      "pages": 202,
+      "done": true
+    },
+    {
+      "country": "JP",
+      "selection": {
+        "available_only": "true"
+      },
+      "year_min": 2020,
+      "year_max": null,
+      "pages": 364,
+      "done": true
+    },
+    {
+      "country": "KR",
+      "selection": {},
+      "year_min": null,
+      "year_max": 2015,
+      "pages": 1431,
+      "done": false
+    },
+    {
+      "country": "KR",
+      "selection": {},
+      "year_min": 2016,
+      "year_max": 2019,
+      "pages": 1461,
+      "done": false
+    },
+    {
+      "country": "KR",
+      "selection": {},
+      "year_min": 2020,
+      "year_max": null,
+      "pages": 1459,
+      "done": false
+    },
+    {
+      "country": "KR",
+      "selection": {
+        "available_only": "true"
+      },
+      "year_min": null,
+      "year_max": 2015,
+      "pages": 106,
+      "done": true
+    },
+    {
+      "country": "KR",
+      "selection": {
+        "available_only": "true"
+      },
+      "year_min": 2016,
+      "year_max": 2019,
+      "pages": 193,
+      "done": true
+    },
+    {
+      "country": "KR",
+      "selection": {
+        "available_only": "true"
+      },
+      "year_min": 2020,
+      "year_max": null,
+      "pages": 319,
+      "done": true
+    }
+  ],
+  "session_attempts": 16,
+  "session_responses": 16,
+  "session_bytes": 3281617,
+  "session_seconds": 9.809,
+  "http_statuses": {
+    "200": 13,
+    "502": 3
+  },
+  "http_errors": 3,
+  "transport_errors": 0,
+  "logged_errors": 1,
+  "retry_at": null,
+  "http_503": null,
+  "retries_503": 0,
+  "recoveries_503": 0
+}
