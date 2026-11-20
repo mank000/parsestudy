@@ -36,6 +36,9 @@ jobs:
           fi
           curl -fsS http://127.0.0.1:8775/analytics > analytics.html
           grep -q 'Предложения по странам' analytics.html
+      - name: Проверить домашний каталог Scrapy в контейнере
+        run: |
+          docker compose -p satauto-catalog-demo exec -T dashboard python -c 'from pathlib import Path; from tempfile import NamedTemporaryFile; NamedTemporaryFile(dir=Path.home()).close()'
       - name: Проверить Swagger в Docker
         env:
           CATALOG_WEB_PORT: 8775
