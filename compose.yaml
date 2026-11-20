@@ -63,6 +63,9 @@ services:
     depends_on:
       dashboard:
         condition: service_healthy
+    env_file:
+      - path: .telegram.env
+        required: false
     environment:
       <<: *catalog-database
       SATAUTO_COUNTRY: ${SATAUTO_COUNTRY:-}

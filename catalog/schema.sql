@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS catalog_sync_state (
     recent_at timestamptz,
     full_completed_at timestamptz
 );
+ALTER TABLE catalog_sync_state ADD COLUMN IF NOT EXISTS pages_saved bigint NOT NULL DEFAULT 0;
+ALTER TABLE catalog_sync_state ADD COLUMN IF NOT EXISTS alert_kind text;
+ALTER TABLE catalog_sync_state ADD COLUMN IF NOT EXISTS alert_pages bigint;
 
 CREATE INDEX IF NOT EXISTS vehicle_pending_detail_idx ON vehicle (run_id, car_id)
     WHERE detail IS NULL AND NOT detail_missing;

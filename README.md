@@ -60,6 +60,7 @@ GitHub Actions запускает этот набор и проверяет чи
 
 - [Архитектура и переменные окружения](docs/architecture.md)
 - [Синхронизация SATAuto, планировщик и восстановление](docs/catalog-sync.md)
+- [Алерты сборщика в Telegram](docs/catalog-sync.md#уведомления-в-telegram)
 - [Схема PostgreSQL](docs/database-schema.md)
 - [Справочник комплектаций](docs/trim-reference.md)
 - [Замеры и ограничения сбора](reports/RESULTS.md)

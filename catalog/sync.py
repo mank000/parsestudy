@@ -13,9 +13,11 @@ import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import monotonic
 
 import psycopg
 
+from .alerts import SyncAlerts, TelegramAlerts
 from .satauto import BASE
 from .store import initialize
 from .worker import retry_delay
@@ -63,6 +65,8 @@ def main():
             return 2
         initialize(db)
         db.execute("INSERT INTO catalog_sync_state(profile) VALUES(%s) ON CONFLICT DO NOTHING", (profile,))
+        telegram = TelegramAlerts.from_environment()
+        alerts = SyncAlerts(db, telegram, profile, selection) if telegram else None
         failures = {"archive": 0, "recent": 0}
         archive_retry_at = None
         recent_in_progress = False
@@ -91,8 +95,17 @@ def main():
                     command.extend(["--" + name.replace("_", "-"), str(value)])
                 if restart:
                     command.append("--restart")
+                if alerts:
+                    command.extend(["--sync-profile", profile])
+                    alerts.observe(lane)
                 print(f"Синхронизация: {lane}, до {pages} страниц", flush=True)
-                child = subprocess.Popen(command)
+                last_check = monotonic()
+                try:
+                    child = subprocess.Popen(command)
+                except OSError as error:
+                    if alerts and not stop.is_set():
+                        alerts.observe(lane, reason=type(error).__name__)
+                    raise
                 while child.poll() is None:
                     if stop.wait(0.5):
                         try:
@@ -101,8 +114,17 @@ def main():
                             child.kill()
                             child.wait()
                         return 0
+                    now_check = monotonic()
+                    if alerts and now_check - last_check >= 10:
+                        alerts.observe(lane, now_check - last_check)
+                        last_check = now_check
+                if stop.is_set():
+                    return 0
                 metrics = json.loads(output.read_text()) if output.exists() else {}
             code = child.returncode
+            if alerts:
+                reason = (metrics.get("reason") or "код 2") if code == 2 else None
+                alerts.observe(lane, monotonic() - last_check, reason=reason)
             if metrics and restart:
                 if lane == "recent":
                     recent_in_progress = True

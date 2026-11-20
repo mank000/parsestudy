@@ -69,6 +69,7 @@ def arguments():
     satauto_api.add_argument("--restart", action="store_true", help="Начать пагинацию заново с сохранением объявлений")
     satauto_api.add_argument("--output", type=Path)
     satauto_api.add_argument("--schema-ready", action="store_true", help=argparse.SUPPRESS)
+    satauto_api.add_argument("--sync-profile", help=argparse.SUPPRESS)
     satauto_api.add_argument("--lane", choices=["archive", "recent"], default="archive",
                              help="recent: отдельная позиция для проверки первых страниц")
     queue = commands.add_parser("queue", help="Состояние очереди карточек SATAuto")
@@ -241,7 +242,8 @@ def main():
                 filters = {key: value for key, value in filters.items() if value is not None}
                 if args.available_only:
                     filters["available_only"] = "true"
-                return run_satauto_api(db, args.country, args.pages, args.restart, args.output, filters, args.workers, args.lane)
+                return run_satauto_api(db, args.country, args.pages, args.restart, args.output, filters,
+                                       args.workers, args.lane, sync_profile=args.sync_profile)
             if args.action == "import-export":
                 print(import_export(db, args.path))
             if args.action == "queue":

@@ -379,6 +379,9 @@ class CatalogIntegration(unittest.TestCase):
                                          (first["run_id"],)).fetchone()[0])
 
     def test_recent_lane_keeps_archive_cursor_and_refreshes_status_without_deletion(self):
+        from unittest.mock import Mock
+
+        from catalog.alerts import SyncAlerts
         from catalog.store import initialize
         from psycopg.types.json import Jsonb
 
@@ -412,10 +415,23 @@ class CatalogIntegration(unittest.TestCase):
             car["media"]["photos"] = ["https://example.test/detail-photo.jpg"]
             db.execute("UPDATE vehicle SET detail=%s WHERE run_id=%s AND car_id=880001", (Jsonb(car), run))
         self.server.block = True
-        recent = json.loads(self.cli("satauto-api", "--country", "CN", "--lane", "recent", "--restart", "--pages", "1", satauto=True))
+        telegram = Mock(stall_seconds=1800)
+        with psycopg.connect(self.dsn, autocommit=True) as db:
+            db.execute("INSERT INTO catalog_sync_state(profile) VALUES('alert-test-recent')")
+            alerts = SyncAlerts(db, telegram, "alert-test-recent", {"country": "CN"})
+            alerts.observe("recent", reason="http_403")
+        recent = json.loads(self.cli("satauto-api", "--country", "CN", "--lane", "recent", "--restart",
+                                     "--pages", "1", "--sync-profile", "alert-test-recent", satauto=True))
         self.assertEqual(recent["lane"], "recent")
         self.assertEqual(recent["new_records"], 0)
         with psycopg.connect(self.dsn, autocommit=True) as db:
+            alerts = SyncAlerts(db, telegram, "alert-test-recent", {"country": "CN"})
+            alerts.observe("recent")
+            self.assertEqual(telegram.send.call_count, 2)
+            self.assertIn("Сбор восстановился", telegram.send.call_args.args[0])
+            self.assertEqual(db.execute("""
+                SELECT pages_saved, alert_kind FROM catalog_sync_state WHERE profile='alert-test-recent'
+                """).fetchone(), (1, None))
             self.assertEqual(db.execute("SELECT cursor FROM satauto_api_scan WHERE run_id=%s AND filter_key='' AND country='CN'", (run,)).fetchone()[0], "archive-next")
             self.assertEqual(db.execute("SELECT availability,power FROM vehicle_inventory WHERE run_id=%s AND car_id=880001", (run,)).fetchone(), ("sold", 999))
             self.assertEqual(db.execute("SELECT detail#>>'{media,photos,0}' FROM vehicle WHERE run_id=%s AND car_id=880001", (run,)).fetchone()[0], "https://example.test/detail-photo.jpg")
@@ -423,6 +439,40 @@ class CatalogIntegration(unittest.TestCase):
         finished = json.loads(self.cli("satauto-api", "--country", "CN", satauto=True))
         self.assertTrue(finished["complete"])
         self.assertEqual(finished["new_records"], 1)
+
+    def test_sync_alert_waits_out_cooldowns_and_deduplicates_after_restart(self):
+        from unittest.mock import Mock, patch
+
+        from catalog.alerts import SyncAlerts
+        from catalog.store import initialize
+
+        telegram = Mock(stall_seconds=1800)
+        with psycopg.connect(self.dsn, autocommit=True) as db:
+            initialize(db)
+            with db.transaction(force_rollback=True), patch("catalog.alerts.BASE", "alert-test"):
+                db.execute("INSERT INTO catalog_sync_state(profile) VALUES('alert-test')")
+                run_id = db.execute("""
+                    INSERT INTO crawl_run(origin, mode, page_limit, retry_at)
+                    VALUES('alert-test', 'listing', 48, now() + interval '1 hour') RETURNING id
+                    """).fetchone()[0]
+                alerts = SyncAlerts(db, telegram, "alert-test", {"country": "KR", "year_min": 2020})
+                alerts.observe("archive")
+                alerts.observe("archive", 3600)
+                telegram.send.assert_not_called()
+                db.execute("UPDATE crawl_run SET retry_at=NULL WHERE id=%s", (run_id,))
+                alerts.observe("archive", 1799)
+                telegram.send.assert_not_called()
+                alerts.observe("archive", 1)
+                telegram.send.assert_called_once()
+                self.assertIn("KR, от 2020 г.", telegram.send.call_args.args[0])
+                restarted = SyncAlerts(db, telegram, "alert-test", {"country": "KR"})
+                restarted.observe("archive")
+                restarted.observe("archive", 1800)
+                telegram.send.assert_called_once()
+                restarted.observe("archive", reason="invalid_payload")
+                restarted.observe("archive", reason="invalid_payload")
+                self.assertEqual(telegram.send.call_count, 2)
+                self.assertIn("invalid_payload", telegram.send.call_args.args[0])
 
     def test_satauto_api_resumes_server_cursor_without_restarting_other_countries(self):
         from catalog.store import initialize, insert_vehicles

@@ -3,5 +3,6 @@ __pycache__/
 .env
 .api.env
 .api-credentials
+.telegram.env
 .DS_Store
 PROMPT.md

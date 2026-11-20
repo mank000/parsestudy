@@ -134,7 +134,7 @@ class SatautoApiSpider(CatalogSpider):
     }
 
     def __init__(self, db, run_id, scans, page_budget, filters=None, workers=3, state_key=None,
-                 lane="archive", recovering=False):
+                 lane="archive", recovering=False, sync_profile=None):
         super().__init__(db, {"id": run_id, "origin": BASE, "page_limit": PAGE_SIZE}, page_budget)
         self.scans = deque(scans)
         self.filters = filters or {}
@@ -149,6 +149,7 @@ class SatautoApiSpider(CatalogSpider):
         self.gateway_failures = {}
         self.last_success = perf_counter()
         self.gateway_pause = False
+        self.sync_profile = sync_profile
 
     def slow_down(self):
         self.parallelism = 1
@@ -273,6 +274,9 @@ class SatautoApiSpider(CatalogSpider):
                         insert_vehicles(self.db, run_id, cars, refresh_summary=True, batch=True)
                     self.save_position(scan, cursor)
                     self.db.execute("UPDATE crawl_run SET pages=pages+1, status='partial' WHERE id=%s", (run_id,))
+                    if self.sync_profile is not None:
+                        self.db.execute("UPDATE catalog_sync_state SET pages_saved=pages_saved+1 WHERE profile=%s",
+                                        (self.sync_profile,))
         except (ValueError, TypeError, AttributeError):
             self.stop("invalid_vehicle")
         self.pages_this_session += 1
@@ -502,7 +506,8 @@ def partition_state(db, run_id):
     ]
 
 
-def run_satauto_api(db, country, page_budget, restart, output, filters=None, workers=3, lane="archive"):
+def run_satauto_api(db, country, page_budget, restart, output, filters=None, workers=3, lane="archive", *,
+                   sync_profile=None):
     lock_satauto(db)
     filters = filters or {}
     state_filters = {**filters, "_lane": "recent"} if lane == "recent" else filters
@@ -552,7 +557,7 @@ def run_satauto_api(db, country, page_budget, restart, output, filters=None, wor
         process = CrawlerProcess({"LOG_LEVEL": "WARNING", "LOGSTATS_INTERVAL": 0})
         crawler = process.create_crawler(SatautoApiSpider)
         started = perf_counter()
-        process.crawl(crawler, db, run_id, scans, page_budget, filters, workers, key, lane, recovering)
+        process.crawl(crawler, db, run_id, scans, page_budget, filters, workers, key, lane, recovering, sync_profile)
         process.start()
         elapsed = perf_counter() - started
         stats = crawler.stats.get_stats()
