@@ -65,12 +65,28 @@ def main():
             return 2
         initialize(db)
         db.execute("INSERT INTO catalog_sync_state(profile) VALUES(%s) ON CONFLICT DO NOTHING", (profile,))
+        next_heartbeat = 0
+
+        def heartbeat():
+            nonlocal next_heartbeat
+            now = monotonic()
+            if now >= next_heartbeat:
+                db.execute("UPDATE catalog_sync_state SET heartbeat_at=clock_timestamp() WHERE profile=%s", (profile,))
+                next_heartbeat = now + 15
+
+        def wait(seconds):
+            deadline = monotonic() + seconds
+            while not stop.is_set() and monotonic() < deadline:
+                heartbeat()
+                stop.wait(max(0, min(next_heartbeat, deadline) - monotonic()))
+
         telegram = TelegramAlerts.from_environment()
         alerts = SyncAlerts(db, telegram, profile, selection) if telegram else None
         failures = {"archive": 0, "recent": 0}
         archive_retry_at = None
         recent_in_progress = False
         while not stop.is_set():
+            heartbeat()
             recent, completed = db.execute("SELECT recent_at,full_completed_at FROM catalog_sync_state WHERE profile=%s", (profile,)).fetchone()
             now = datetime.now(timezone.utc)
             lane = "recent" if recent is None or (now - recent).total_seconds() >= args.recent_interval else "archive"
@@ -79,11 +95,11 @@ def main():
             if lane == "archive" and completed is not None and not restart:
                 if args.once:
                     return 0
-                stop.wait(min(30, args.recent_interval))
+                wait(min(30, args.recent_interval))
                 continue
             if lane == "archive" and archive_retry_at is not None and archive_retry_at > now:
                 next_recent = recent + timedelta(seconds=args.recent_interval)
-                stop.wait(max(0, (min(archive_retry_at, next_recent) - now).total_seconds()))
+                wait(max(0, (min(archive_retry_at, next_recent) - now).total_seconds()))
                 continue
             pages = args.recent_pages if lane == "recent" else args.archive_pages
             with tempfile.TemporaryDirectory(prefix="catalog-sync-") as folder:
@@ -95,8 +111,8 @@ def main():
                     command.extend(["--" + name.replace("_", "-"), str(value)])
                 if restart:
                     command.append("--restart")
+                command.extend(["--sync-profile", profile])
                 if alerts:
-                    command.extend(["--sync-profile", profile])
                     alerts.observe(lane)
                 print(f"Синхронизация: {lane}, до {pages} страниц", flush=True)
                 last_check = monotonic()
@@ -114,6 +130,7 @@ def main():
                             child.kill()
                             child.wait()
                         return 0
+                    heartbeat()
                     now_check = monotonic()
                     if alerts and now_check - last_check >= 10:
                         alerts.observe(lane, now_check - last_check)
@@ -140,7 +157,7 @@ def main():
                     archive_retry_at = datetime.now(timezone.utc) + timedelta(seconds=retry_delay(failures[lane], retry))
                 else:
                     retry = db.execute("SELECT max(retry_at) FROM crawl_run WHERE origin=%s", (BASE,)).fetchone()[0]
-                    stop.wait(retry_delay(failures[lane], retry))
+                    wait(retry_delay(failures[lane], retry))
                 continue
             failures[lane] = 0
             if lane == "recent":

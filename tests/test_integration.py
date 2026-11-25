@@ -953,8 +953,9 @@ class CatalogIntegration(unittest.TestCase):
             spider = SatautoApiSpider(db, run_id, [expired], 120, workers=6)
             spider.crawler = Mock()
             db.execute("""
-                INSERT INTO crawl_cursor SELECT %s,%s||n FROM generate_series(1,120) AS n
-                """, (run_id, spider.cursor_prefix(expired)))
+                INSERT INTO crawl_cursor(run_id,value,kind,country,filter_digest,partition)
+                SELECT %s,n::text,'satauto','CN',%s,1 FROM generate_series(1,120) AS n
+                """, (run_id, spider.filter_digest))
             with patch("catalog.satauto_api.TARGET_RANGE_ROWS", 2):
                 replacements = spider.reset_cursor(expired)
             self.assertEqual([scan.filters for scan in replacements], [

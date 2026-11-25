@@ -1,5 +1,6 @@
 """Local, read-only dashboard for SATAuto listings and collection metrics."""
 import argparse
+import json
 import os
 import re
 from html import escape
@@ -132,6 +133,28 @@ def database_sections(dsn):
     return requests, prices
 
 
+def sync_status(dsn, profile):
+    try:
+        with psycopg.connect(dsn, connect_timeout=3, row_factory=dict_row) as db:
+            db.read_only = True
+            db.execute("SET LOCAL statement_timeout='3s'")
+            state = db.execute("""
+                SELECT heartbeat_at, clock_timestamp() AS checked_at
+                FROM catalog_sync_state WHERE profile=%s
+                """, (profile,)).fetchone()
+            if state is None:
+                return 404, {"error": "Профиль синхронизации не зарегистрирован"}
+            rows = db.execute("""
+                SELECT country, coalesce(nullif(filter_key,''),'{}')::jsonb AS selection,
+                       partition, year_min, year_max, last_success_at
+                FROM catalog_sync_progress WHERE profile=%s
+                ORDER BY country, filter_key, partition
+                """, (profile,)).fetchall()
+    except psycopg.Error:
+        return 503, {"error": "Статус синхронизации временно недоступен"}
+    return 200, {**state, "rows": rows}
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_request(self, code="-", size="-"):
         if self.path != "/healthz":
@@ -156,6 +179,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if url.path == "/filters.js":
             return self.send_content(200, "text/javascript", (ASSETS / "filters.js").read_text(encoding="utf-8"))
         params = parse_qs(url.query, keep_blank_values=True)
+        if url.path == "/sync/status":
+            profile = params.get("profile", ["all"])[0]
+            status, body = sync_status(self.server.dsn, profile)
+            return self.send_content(status, "application/json", json.dumps(body, ensure_ascii=False,
+                                                                           default=lambda dt: dt.isoformat()))
         if url.path in ("/inventory/options", "/inventory/summary"):
             status, content = inventory_html(self.server.dsn, params, section=url.path.rsplit("/", 1)[1])
             return self.send_content(status, "text/html", content)

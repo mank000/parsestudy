@@ -1,10 +1,12 @@
 import json
+import io
 import threading
 import unittest
+from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from catalog.alerts import TelegramAlerts
+from catalog.alerts import TelegramAlerts, main
 
 
 class TelegramDeliveryTests(unittest.TestCase):
@@ -13,6 +15,18 @@ class TelegramDeliveryTests(unittest.TestCase):
             self.assertIsNone(TelegramAlerts.from_environment())
         with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "123:test", "TELEGRAM_CHAT_ID": "-123"}, clear=True):
             self.assertEqual(TelegramAlerts.from_environment().stall_seconds, 1800)
+
+    def test_smoke_command_attempts_all_three_notifications(self):
+        telegram = Mock(stall_seconds=5)
+        telegram.send.side_effect = [True, False, True]
+        with patch("sys.argv", ["alerts", "--test-events"]), patch("catalog.alerts.sleep"), \
+                patch.object(TelegramAlerts, "from_environment", return_value=telegram), redirect_stdout(io.StringIO()):
+            self.assertEqual(main(), 1)
+        messages = [call.args[0] for call in telegram.send.call_args_list]
+        self.assertEqual(len(messages), 3)
+        for message, label in zip(messages, ("Сбор остановлен", "Страницы не сохраняются", "Сбор восстановился")):
+            self.assertTrue(message.startswith("ТЕСТ"))
+            self.assertIn(label, message)
 
     def test_send_message_and_sanitize_failures(self):
         requests = []

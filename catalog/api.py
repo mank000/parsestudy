@@ -4,6 +4,8 @@ import getpass
 import hashlib
 import hmac
 import json
+import logging
+import math
 import os
 import re
 import secrets
@@ -23,12 +25,11 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, create_model, 
 
 from .inventory import INVENTORY_FIELDS, SAT
 
-USER_SCHEMA = """
-CREATE TABLE IF NOT EXISTS api_user (
-    username text PRIMARY KEY, password_hash text NOT NULL,
-    enabled boolean NOT NULL DEFAULT true, token_version int NOT NULL DEFAULT 1
-)
-"""
+from .store import migrate
+
+LOGGER = logging.getLogger(__name__)
+TOKEN_ATTEMPTS = 10
+TOKEN_WINDOW_SECONDS = 60
 SCALAR_FIELDS = {name.strip() for name in INVENTORY_FIELDS.split(",")} | {"run_id"}
 INTEGER_FIELDS = {"run_id", "car_id", "year", "mileage"}
 NUMBERS = {"run_id", "car_id", "year", "mileage", "engine_cc", "power", "seller_price",
@@ -107,15 +108,46 @@ class Token(BaseModel):
     expires_in: int = 1800
 
 
+def reserve_token_attempt(db, client):
+    db.execute("""
+        WITH expired AS (
+            SELECT client FROM api_token_rate WHERE reset_at<=statement_timestamp()
+            ORDER BY reset_at LIMIT 128 FOR UPDATE SKIP LOCKED
+        )
+        DELETE FROM api_token_rate rate USING expired WHERE rate.client=expired.client
+        """)
+    reserved = db.execute("""
+        INSERT INTO api_token_rate (client,reset_at,attempts)
+        VALUES (%s,statement_timestamp()+make_interval(secs=>%s),1)
+        ON CONFLICT (client) DO UPDATE SET
+            reset_at=CASE WHEN api_token_rate.reset_at<=statement_timestamp()
+                          THEN excluded.reset_at ELSE api_token_rate.reset_at END,
+            attempts=CASE WHEN api_token_rate.reset_at<=statement_timestamp()
+                          THEN 1 ELSE api_token_rate.attempts+1 END
+        WHERE api_token_rate.reset_at<=statement_timestamp() OR api_token_rate.attempts<%s
+        RETURNING attempts
+        """, (client, TOKEN_WINDOW_SECONDS, TOKEN_ATTEMPTS)).fetchone()
+    if reserved is None:
+        wait = db.execute("""
+            SELECT extract(epoch FROM reset_at-clock_timestamp()) AS seconds
+            FROM api_token_rate WHERE client=%s
+            """, (client,)).fetchone()
+        LOGGER.warning("Выдача JWT ограничена для клиента %s", client)
+        raise HTTPException(429, "Слишком много попыток. Повторите позже.",
+                            headers={"Retry-After": str(max(1, math.ceil(wait["seconds"])) if wait else 1)})
+
+
 @app.post("/token", response_model=Token, tags=["Авторизация"])
-def login(form: Annotated[OAuth2PasswordRequestForm, Depends()], response: Response):
+def login(form: Annotated[OAuth2PasswordRequestForm, Depends()], request: Request, response: Response):
     secret()
-    if len(form.username) > 120 or len(form.password) > 1024:
-        raise HTTPException(401, "Неверные учётные данные")
+    client = request.client.host if request.client else "unknown"
     with connection() as db:
-        user = db.execute("SELECT * FROM api_user WHERE username=%s", (form.username,)).fetchone()
-    valid = verify_password(form.password, user["password_hash"] if user else DUMMY_HASH)
+        reserve_token_attempt(db, client)
+        within_limits = len(form.username) <= 120 and len(form.password) <= 1024
+        user = db.execute("SELECT * FROM api_user WHERE username=%s", (form.username,)).fetchone() if within_limits else None
+    valid = within_limits and verify_password(form.password, user["password_hash"] if user else DUMMY_HASH)
     if not valid or not user or not user["enabled"]:
+        LOGGER.warning("Неуспешная попытка получения JWT от клиента %s", client)
         raise HTTPException(401, "Неверные учётные данные", headers={"WWW-Authenticate": "Bearer"})
     response.headers["Cache-Control"] = "no-store"
     return Token(access_token=encode_token({"sub": user["username"], "ver": user["token_version"]}, "catalog-api", 30))
@@ -391,7 +423,7 @@ def main():
     if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,120}", args.username):
         parser.error("Некорректное имя пользователя")
     with connection() as db:
-        db.execute(USER_SCHEMA)
+        migrate(db)
         if args.action == "disable-user":
             db.execute("UPDATE api_user SET enabled=false,token_version=token_version+1 WHERE username=%s", (args.username,))
         else:

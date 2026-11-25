@@ -1,10 +1,11 @@
 """Opt-in Telegram notifications for the SATAuto supervisor."""
+import argparse
 import json
 import logging
 import os
 import re
 from http.client import HTTPException
-from time import monotonic
+from time import monotonic, sleep
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -64,6 +65,17 @@ class TelegramAlerts:
         return False
 
 
+def alert_message(event, lane, scope, *, reason=None, seconds=None):
+    if event == "stopped":
+        message = f"Сбор остановлен из-за ошибки. Причина — {reason}."
+    elif event == "stalled":
+        message = f"Страницы не сохраняются уже {seconds} с активного обхода."
+    else:
+        message = "Сбор восстановился. Новая страница сохранена в PostgreSQL."
+    label = "новые объявления" if lane == "recent" else "архив"
+    return f"SATAuto · {label} · {scope}\n{message}"
+
+
 class SyncAlerts:
     def __init__(self, db, telegram, profile, selection):
         self.db = db
@@ -103,20 +115,17 @@ class SyncAlerts:
             if incident == "stopped":
                 return
             event = "stopped"
-            message = f"Сбор остановлен из-за ошибки. Причина — {reason}."
         elif incident and pages > incident_pages:
             event = "recovered"
-            message = "Сбор восстановился. Новая страница сохранена в PostgreSQL."
         elif not incident and not paused and self.active_seconds >= self.telegram.stall_seconds:
             event = "stalled"
-            message = f"Страницы не сохраняются уже {int(self.active_seconds)} с активного обхода."
         else:
             return
 
         if monotonic() < self.retry_after.get(event, 0):
             return
-        label = "новые объявления" if lane == "recent" else "архив"
-        if not self.telegram.send(f"SATAuto · {label} · {self.scope}\n{message}"):
+        message = alert_message(event, lane, self.scope, reason=reason, seconds=int(self.active_seconds))
+        if not self.telegram.send(message):
             self.retry_after[event] = monotonic() + 60
             return
         self.retry_after.clear()
@@ -126,14 +135,26 @@ class SyncAlerts:
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--test-events", action="store_true",
+                        help="Отправить три сообщения с пометкой ТЕСТ в настроенный тестовый чат")
+    args = parser.parse_args()
     telegram = TelegramAlerts.from_environment()
     if telegram is None:
         LOGGER.error("Укажите TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в .telegram.env.")
         return 1
-    if not telegram.send("SATAuto · проверка доставки уведомлений"):
-        return 1
-    print("Тестовое уведомление отправлено.")
-    return 0
+    messages = ["SATAuto · проверка доставки уведомлений"]
+    if args.test_events:
+        messages = ["ТЕСТ · " + alert_message(event, "recent", "JP", reason="контрольная ошибка",
+                                              seconds=telegram.stall_seconds)
+                    for event in ("stopped", "stalled", "recovered")]
+    delivered = 0
+    for index, message in enumerate(messages):
+        if index:
+            sleep(1.1)
+        delivered += telegram.send(message)
+    print(f"Telegram подтвердил {delivered} из {len(messages)} тестовых уведомлений.")
+    return 0 if delivered == len(messages) else 1
 
 
 if __name__ == "__main__":

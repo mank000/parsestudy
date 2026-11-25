@@ -11,7 +11,7 @@ from scrapy.downloadermiddlewares.retry import get_retry_request
 from scrapy.exceptions import CloseSpider, IgnoreRequest
 from scrapy.http import TextResponse
 
-from .store import insert_vehicles
+from .store import InvalidVehicle, insert_vehicles
 
 
 PUBLIC_ORIGIN = "https://carhubauto.ru"
@@ -165,11 +165,12 @@ class CatalogSpider(scrapy.Spider):
             self.stop("invalid_pagination")
         return cars, cursor
 
-    def remember_cursor(self, value):
-        added = self.db.execute(
-            "INSERT INTO crawl_cursor VALUES (%s,%s) ON CONFLICT DO NOTHING",
-            (self.run["id"], value),
-        ).rowcount
+    def remember_cursor(self, value, *, scope=None):
+        kind, country, filter_digest, partition = scope or ("carhub", None, None, None)
+        added = self.db.execute("""
+            INSERT INTO crawl_cursor (run_id, value, kind, country, filter_digest, partition)
+            VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING
+            """, (self.run["id"], value, kind, country, filter_digest, partition)).rowcount
         if not added:
             self.stop("repeated_cursor")
 
@@ -184,7 +185,8 @@ class CatalogSpider(scrapy.Spider):
                     """UPDATE crawl_run SET pages=pages+1, cursor=%s, listing_done=%s
                        WHERE id=%s""", (cursor, cursor is None, self.run["id"]),
                 )
-        except (ValueError, TypeError, AttributeError):
+        except InvalidVehicle as error:
+            self.logger.warning("Некорректная карточка: %s", error)
             self.stop("invalid_vehicle")
         self.pages_this_session += 1
         if cursor is None:

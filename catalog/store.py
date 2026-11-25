@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 from psycopg.errors import UniqueViolation
+from psycopg.rows import scalar_row
 from psycopg.types.json import Jsonb
 
 
@@ -13,9 +14,21 @@ VEHICLE_COLUMNS = """
 """
 
 
+class InvalidVehicle(ValueError):
+    pass
+
+
+def validate_vehicle(car):
+    if not isinstance(car, dict) or type(car.get("id")) is not int or not 0 < car["id"] < 2**63:
+        raise InvalidVehicle("Ожидалась карточка с положительным целочисленным id")
+    for name in ("source", "listing", "identity", "specs", "pricing", "links"):
+        section = car.get(name)
+        if section is not None and not isinstance(section, dict):
+            raise InvalidVehicle(f"Карточка {car['id']}: поле {name} должно быть объектом")
+
+
 def fields(car):
-    if not isinstance(car, dict) or type(car.get("id")) is not int or car["id"] < 1:
-        raise ValueError("Карточка без валидного id")
+    validate_vehicle(car)
     source = car.get("source") or {}
     listing = car.get("listing") or {}
     identity = car.get("identity") or {}
@@ -31,10 +44,31 @@ def fields(car):
     )
 
 
+def migrate(db):
+    migrations = sorted(Path(__file__).with_name("migrations").glob("[0-9][0-9][0-9][0-9]_*.sql"))
+    with db.transaction():
+        db.execute("SELECT pg_advisory_xact_lock(274813)")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS catalog_schema_migration (
+                version integer PRIMARY KEY,
+                name text NOT NULL,
+                applied_at timestamptz NOT NULL DEFAULT clock_timestamp()
+            )
+            """)
+        with db.cursor(row_factory=scalar_row) as cursor:
+            applied = set(cursor.execute("SELECT version FROM catalog_schema_migration").fetchall())
+        for migration in migrations:
+            version = int(migration.name.split("_", 1)[0])
+            if version not in applied:
+                db.execute(migration.read_text(encoding="utf-8"))
+                db.execute("INSERT INTO catalog_schema_migration(version,name) VALUES (%s,%s)",
+                           (version, migration.name))
+
+
 def initialize(db):
     from .inventory_cache import initialize_inventory
 
-    db.execute(Path(__file__).with_name("schema.sql").read_text(encoding="utf-8"))
+    migrate(db)
     initialize_inventory(db)
 
 
@@ -123,6 +157,6 @@ def export_rows(stream, run_id):
             continue
         try:
             values = fields(json.loads(line))
-        except (ValueError, TypeError, AttributeError) as exc:
+        except (json.JSONDecodeError, InvalidVehicle) as exc:
             raise ValueError(f"Некорректная строка NDJSON {number}") from exc
         yield run_id, *values, line, line

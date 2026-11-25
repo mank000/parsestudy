@@ -1,13 +1,15 @@
 import os
 import unittest
+from hashlib import sha256
+from pathlib import Path
 from unittest.mock import patch
 
 import psycopg
 from fastapi.testclient import TestClient
 
-from catalog.api import app, USER_SCHEMA, password_hash, encode_token
+from catalog.api import app, password_hash, encode_token
 from catalog.inventory import inventory_html
-from catalog.store import initialize, insert_vehicles
+from catalog.store import initialize, insert_vehicles, migrate
 
 
 class CatalogApiTests(unittest.TestCase):
@@ -24,7 +26,6 @@ class CatalogApiTests(unittest.TestCase):
         cls.env.start()
         with psycopg.connect(cls.dsn, autocommit=True) as db:
             initialize(db)
-            db.execute(USER_SCHEMA)
             db.execute("INSERT INTO api_user(username,password_hash) VALUES('reader',%s)", (password_hash("test-password-123"),))
             cls.run_id = db.execute("INSERT INTO crawl_run(origin,mode,page_limit) VALUES('https://satauto.ru','listing',48) RETURNING id").fetchone()[0]
             insert_vehicles(db, cls.run_id, [{"id": i, "source": {"country": "CN"},
@@ -45,6 +46,56 @@ class CatalogApiTests(unittest.TestCase):
         with psycopg.connect(cls.dsn, autocommit=True) as db:
             db.execute(f"DROP SCHEMA {cls.schema} CASCADE")
         cls.env.stop()
+
+    def setUp(self):
+        with psycopg.connect(self.dsn, autocommit=True) as db:
+            db.execute("TRUNCATE api_token_rate")
+
+    def test_token_rate_limit_applies_before_password_check(self):
+        with patch("catalog.api.TOKEN_ATTEMPTS", 2):
+            for username in ("reader", "absent"):
+                response = self.client.post("/token", data={"username": username, "password": "bad"})
+                self.assertEqual(response.status_code, 401)
+            with patch("catalog.api.verify_password", side_effect=AssertionError("hashed blocked request")):
+                response = self.client.post("/token", data={"username": "reader", "password": "x"})
+            self.assertEqual(response.status_code, 429)
+            self.assertGreater(int(response.headers["Retry-After"]), 0)
+            with psycopg.connect(self.dsn, autocommit=True) as db:
+                db.execute("UPDATE api_token_rate SET reset_at=now()-interval '1 second'")
+            self.headers()
+
+    def test_legacy_cursor_migration_preserves_progress_and_is_repeatable(self):
+        schema = self.schema + "_legacy"
+        with psycopg.connect(self.dsn, autocommit=True) as db:
+            db.execute(f"CREATE SCHEMA {schema}")
+            try:
+                db.execute(f"SET search_path TO {schema}")
+                legacy = Path(__file__).resolve().parents[1] / "catalog/migrations/0001_legacy_schema.sql"
+                db.execute(legacy.read_text(encoding="utf-8"))
+                ids = dict(db.execute("""
+                    INSERT INTO crawl_run(origin,mode,page_limit)
+                    VALUES ('https://satauto.ru','listing',48), ('https://carhubauto.ru','listing',48)
+                    RETURNING origin,id
+                    """).fetchall())
+                satauto_id, carhub_id = ids["https://satauto.ru"], ids["https://carhubauto.ru"]
+                digest, scope = sha256(b"cursor").hexdigest(), sha256(b"").hexdigest()
+                raw_cursor = f"satauto-api:JP:{digest}"
+                db.execute("INSERT INTO satauto_api_scan(run_id,country,cursor,pages) VALUES (%s,'JP','continue',8)",
+                           (satauto_id,))
+                db.execute("INSERT INTO crawl_cursor VALUES (%s,%s),(%s,%s),(%s,%s)",
+                           (satauto_id, raw_cursor, satauto_id, f"satauto-api-part:JP:{scope}:0:{digest}",
+                            carhub_id, raw_cursor))
+                migrate(db)
+                migrate(db)
+                self.assertEqual(db.execute("SELECT count(*) FROM catalog_schema_migration").fetchone(), (4,))
+                self.assertEqual(db.execute("SELECT cursor,pages FROM satauto_api_scan").fetchone(), ("continue", 8))
+                self.assertCountEqual(db.execute("""
+                    SELECT run_id,value,kind,country,filter_digest,partition FROM crawl_cursor
+                    """).fetchall(), [(satauto_id, digest, "satauto", "JP", scope, None),
+                                       (satauto_id, digest, "satauto", "JP", scope, 0),
+                                       (carhub_id, raw_cursor, "carhub", None, None, None)])
+            finally:
+                db.execute(f"DROP SCHEMA {schema} CASCADE")
 
     def headers(self):
         response = self.client.post("/token", data={"username": "reader", "password": "test-password-123"})

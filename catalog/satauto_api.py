@@ -9,12 +9,12 @@ from urllib.parse import urlencode
 
 from scrapy.crawler import CrawlerProcess
 from scrapy.downloadermiddlewares.retry import get_retry_request
-from scrapy.exceptions import IgnoreRequest
+from scrapy.exceptions import CloseSpider, IgnoreRequest
 
 from .satauto import BASE, finish_satauto_session, latest_satauto_run, lock_satauto, satauto_counts
 from .sitemap import COUNTRY_CODES
 from .spider import MAX_INLINE_WAIT, AccessGuard, CatalogSpider, response_retry_at, session_metrics
-from .store import insert_vehicles
+from .store import InvalidVehicle, insert_vehicles, validate_vehicle
 
 
 PAGE_SIZE = 48
@@ -145,6 +145,8 @@ class SatautoApiSpider(CatalogSpider):
         self.parallelism = 1 if recovering else self.maximum_parallelism
         self.healthy_pages = 0
         self.in_flight = 0
+        self.callback_failed = False
+        self.filter_digest = sha256(self.filter_key.encode()).hexdigest()
         self.source_retry_at = None
         self.gateway_failures = {}
         self.last_success = perf_counter()
@@ -180,7 +182,7 @@ class SatautoApiSpider(CatalogSpider):
                 self.logger.warning("Ошибки шлюза в нескольких диапазонах · пауза до %s", when.isoformat())
 
     def next_requests(self):
-        while self.scans and self.in_flight < self.parallelism:
+        while not self.callback_failed and self.scans and self.in_flight < self.parallelism:
             if self.page_budget is not None and self.pages_this_session + self.in_flight >= self.page_budget:
                 return
             scan = self.scans.popleft()
@@ -190,9 +192,10 @@ class SatautoApiSpider(CatalogSpider):
             suffix = "?" + urlencode(query)
             if len(BASE) + len(self.api_path) + len(suffix) > self.settings.getint("URLLENGTH_LIMIT"):
                 self.stop("cursor_url_too_long")
-            self.in_flight += 1
             # A server-side restart may legitimately reuse a URL. Cursor loops are checked in the DB.
-            yield self.request(suffix, self.parse_page, cb_kwargs={"scan": scan}, dont_filter=True)
+            request = self.request(suffix, self.parse_page, cb_kwargs={"scan": scan}, dont_filter=True)
+            self.in_flight += 1
+            yield request
 
     async def start(self):
         self.crawler.stats.set_value("catalog/api_parallelism", self.parallelism)
@@ -219,7 +222,33 @@ class SatautoApiSpider(CatalogSpider):
             if path := paths.get(car["id"]):
                 car["links"] = {**(car.get("links") or {}), "detail": path}
 
+    def request_failed(self, failure):
+        try:
+            if not self.callback_failed:
+                super().request_failed(failure)
+        finally:
+            self.callback_failed = True
+            self.in_flight -= 1
+
     def parse_page(self, response, scan):
+        try:
+            if self.callback_failed:
+                return
+            self.process_page(response, scan)
+        except CloseSpider:
+            self.callback_failed = True
+            raise
+        except Exception:
+            self.callback_failed = True
+            self.crawler.stats.set_value("catalog/diagnostic", "api_error")
+            raise
+        finally:
+            self.in_flight -= 1
+        if self.scans and self.in_flight == 0 and self.page_budget is not None and self.pages_this_session >= self.page_budget:
+            self.stop("page_budget")
+        yield from self.next_requests()
+
+    def process_page(self, response, scan):
         started = perf_counter()
         if self.gateway_pause and response.status in GATEWAY_ERRORS:
             self.stop(GATEWAY_PAUSE, self.source_retry_at)
@@ -227,34 +256,31 @@ class SatautoApiSpider(CatalogSpider):
                 and not response.headers.get("Retry-After")
                 and (self.source_retry_at is None or self.source_retry_at <= datetime.now(timezone.utc))):
             self.defer_scan(scan, f"HTTP {response.status}")
-            yield from self.next_requests()
             return
         if response.status == 409 and scan.cursor:
             try:
-                detail = response.json().get("detail", "")
-            except (ValueError, AttributeError):
-                detail = ""
-            if "catalog version changed" in str(detail).lower() and not response.headers.get("Retry-After"):
+                body = response.json()
+            except (ValueError, UnicodeError):
+                body = None
+            detail = body.get("detail") if isinstance(body, dict) else None
+            if (isinstance(detail, str) and "catalog version changed" in detail.lower()
+                    and not response.headers.get("Retry-After")):
                 if scan.cursor_resets >= 2 and self.is_archive:
                     self.defer_scan(scan, "повторная смена версии каталога")
-                    yield from self.next_requests()
                     return
                 if scan.cursor_resets >= 2:
                     self.stop("cursor_expired")
                 replacements = self.reset_cursor(scan)
-                self.in_flight -= 1
                 self.scans.extend(replacements)
                 self.maximum_parallelism = min(self.workers, max(
-                    self.maximum_parallelism, len(self.scans) + self.in_flight))
-                yield from self.next_requests()
+                    self.maximum_parallelism, len(self.scans) + self.in_flight - 1))
                 return
         cars, cursor = self.listing_page(response, allow_empty=True)
         country = scan.country
         run_id = self.run["id"]
         try:
             for car in cars:
-                if type(car.get("id")) is not int or not 0 < car["id"] < 2**63:
-                    self.stop("invalid_vehicle")
+                validate_vehicle(car)
                 if (car.get("source") or {}).get("country") != country:
                     self.stop("unexpected_source_country")
                 year = (car.get("listing") or {}).get("year")
@@ -266,7 +292,7 @@ class SatautoApiSpider(CatalogSpider):
             with self.db.transaction():
                 if cursor:
                     digest = sha256(cursor.encode()).hexdigest()
-                    self.remember_cursor(self.cursor_prefix(scan) + digest)
+                    self.remember_cursor(digest, scope=("satauto", country, self.filter_digest, scan.partition))
                 if cars:
                     self.add_detail_links(cars)
                 with self.db.pipeline():
@@ -275,9 +301,19 @@ class SatautoApiSpider(CatalogSpider):
                     self.save_position(scan, cursor)
                     self.db.execute("UPDATE crawl_run SET pages=pages+1, status='partial' WHERE id=%s", (run_id,))
                     if self.sync_profile is not None:
+                        self.db.execute("""
+                            INSERT INTO catalog_sync_progress(
+                                profile,country,filter_key,partition,year_min,year_max,last_success_at)
+                            VALUES (%s,%s,%s,%s,%s,%s,clock_timestamp())
+                            ON CONFLICT (profile,country,filter_key,partition) DO UPDATE
+                            SET year_min=excluded.year_min, year_max=excluded.year_max,
+                                last_success_at=excluded.last_success_at
+                            """, (self.sync_profile, country, self.filter_key, scan.partition,
+                                  scan.filters.get("year_min"), scan.filters.get("year_max")))
                         self.db.execute("UPDATE catalog_sync_state SET pages_saved=pages_saved+1 WHERE profile=%s",
                                         (self.sync_profile,))
-        except (ValueError, TypeError, AttributeError):
+        except InvalidVehicle as error:
+            self.logger.warning("Некорректная карточка: %s", error)
             self.stop("invalid_vehicle")
         self.pages_this_session += 1
         self.healthy_pages += 1
@@ -287,7 +323,6 @@ class SatautoApiSpider(CatalogSpider):
             self.crawler.stats.set_value("catalog/api_parallelism", self.parallelism)
             self.logger.warning("Источник отвечает успешно · параллельных запросов: %s", self.parallelism)
         self.crawler.stats.inc_value("catalog/api_database_seconds", perf_counter() - started)
-        self.in_flight -= 1
         self.crawler.stats.inc_value("catalog/api_items", len(cars))
         if self.pages_this_session == 1 or self.pages_this_session % 100 == 0:
             self.logger.warning("SATAuto API · прогон %s · %s · страниц за запуск: %s",
@@ -299,9 +334,6 @@ class SatautoApiSpider(CatalogSpider):
                 self.scans.appendleft(scan)
             else:
                 self.scans.append(scan)
-        if self.scans and self.in_flight == 0 and self.page_budget is not None and self.pages_this_session >= self.page_budget:
-            self.stop("page_budget")
-        yield from self.next_requests()
 
     def defer_scan(self, scan, reason):
         when = datetime.now(timezone.utc) + timedelta(seconds=PARTITION_RETRY_SECONDS)
@@ -316,26 +348,18 @@ class SatautoApiSpider(CatalogSpider):
                 UPDATE satauto_api_partition SET retry_at=%s
                 WHERE run_id=%s AND country=%s AND filter_key=%s AND partition=%s
                 """, (*args, scan.partition))
-        self.in_flight -= 1
         self.crawler.stats.inc_value("catalog/deferred_scans")
         self.logger.warning("%s · %s · %s · продолжу диапазон после %s",
                             reason, scan.country, scan.filters, when.isoformat())
 
-    def cursor_prefix(self, scan):
-        if scan.partition is not None:
-            parent = sha256(self.filter_key.encode()).hexdigest()
-            return f"satauto-api-part:{scan.country}:{parent}:{scan.partition}:"
-        prefix = f"satauto-api:{scan.country}:"
-        return prefix + sha256(self.filter_key.encode()).hexdigest() + ":" if self.filter_key else prefix
-
     def reset_cursor(self, scan):
-        prefix = self.cursor_prefix(scan)
         args = (self.run["id"], scan.country, self.filter_key)
         scans = [scan]
         with self.db.transaction():
             checkpoints = self.db.execute("""
-                DELETE FROM crawl_cursor WHERE run_id=%s AND starts_with(value,%s)
-                """, (self.run["id"], prefix)).rowcount
+                DELETE FROM crawl_cursor WHERE run_id=%s AND kind='satauto'
+                    AND country=%s AND filter_digest=%s AND partition IS NOT DISTINCT FROM %s
+                """, (self.run["id"], scan.country, self.filter_digest, scan.partition)).rowcount
             if scan.partition is None:
                 self.db.execute("""
                     UPDATE satauto_api_scan SET cursor=NULL,done=false
@@ -530,16 +554,9 @@ def run_satauto_api(db, country, page_budget, restart, output, filters=None, wor
                 UPDATE satauto_api_partition SET cursor=NULL, pages=0, done=false, retry_at=NULL
                 WHERE run_id=%s AND country=ANY(%s) AND filter_key=%s
                 """, (run_id, countries, key))
-            selection = sha256(key.encode()).hexdigest() if key else None
             db.execute("""
-                DELETE FROM crawl_cursor WHERE run_id=%s AND split_part(value, ':', 1)='satauto-api'
-                AND split_part(value, ':', 2)=ANY(%s)
-                AND (CASE WHEN %s::text IS NULL THEN array_length(string_to_array(value, ':'), 1)=3
-                          ELSE split_part(value, ':', 3)=%s END)
-                """, (run_id, countries, selection, selection))
-            db.execute("""
-                DELETE FROM crawl_cursor WHERE run_id=%s AND split_part(value, ':', 1)='satauto-api-part'
-                AND split_part(value, ':', 2)=ANY(%s) AND split_part(value, ':', 3)=%s
+                DELETE FROM crawl_cursor WHERE run_id=%s AND kind='satauto'
+                    AND country=ANY(%s) AND filter_digest=%s
                 """, (run_id, countries, sha256(key.encode()).hexdigest()))
         db.execute("""
             INSERT INTO satauto_api_scan (run_id, country, filter_key) SELECT %s, unnest(%s::text[]), %s
@@ -599,6 +616,8 @@ def run_satauto_api(db, country, page_budget, restart, output, filters=None, wor
     print(serialized, end="")
     if output:
         output.write_text(serialized, encoding="utf-8")
+    if reason == "api_error":
+        return 1
     if complete or reason in {"page_budget", "shutdown"}:
         return 0
     permanent = {
